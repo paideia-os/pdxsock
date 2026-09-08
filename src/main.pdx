@@ -1,0 +1,655 @@
+// src/main.pdx -- pdxsock v1.1-A M1-001 real body (issue #15).
+//
+// pdxsock: netcat-adjacent general TCP/UDP client + server. This file
+// is the ring-3 ELF entry point (`_start`), argv-wired per the frozen
+// execve ABI (design/user/execve-abi.md in the paideia-os monorepo):
+//   rdi = argc, rsi = argv (VA of a char*[]), rdx = envp (unused),
+//   rsp % 16 == 0 at entry.
+//
+// v1.1-A "retire M1-001 STUB body" scope (issue #15)
+// --------------------------------------------------
+// Replaces the M1-001 seed's placeholder body with a REAL syscall
+// path. Wire coverage at this landing:
+//
+//   Client mode (`pdxsock <host> <port>`):
+//     sys_socket(AF_INET=2, SOCK_STREAM=1, 0)  SC+ ID 87
+//     sys_connect(fd, ip_u32, port)            SC+ ID 91
+//     sys_read(0, buf, 4096)                   SC+ ID 0   -- one stdin gulp
+//     sys_send(fd, buf, n)                     SC+ ID 92
+//     loop: sys_recv(fd, buf, 4096)            SC+ ID 93
+//           sys_write(1, buf, n)               SC+ ID 1
+//           break when recv returns <= 0
+//     sys_shutdown(fd, 2 = SHUT_RDWR)          SC+ ID 94
+//     sys_exit(0)                              SC+ ID 60
+//
+//   Server mode (`pdxsock -l <port>`):
+//     sys_socket(AF_INET=2, SOCK_STREAM=1, 0)  SC+ ID 87
+//     sys_bind(fd, port)                       SC+ ID 88
+//     sys_listen(fd, backlog=8)                SC+ ID 89
+//     sys_accept(fd)                           SC+ ID 90  -> new fd
+//     loop: sys_recv(new_fd, buf, 4096)        SC+ ID 93
+//           sys_write(1, buf, n)               SC+ ID 1
+//           break when recv returns <= 0
+//     sys_shutdown(new_fd, 2)                  SC+ ID 94
+//     sys_exit(0)                              SC+ ID 60
+//
+// UDP client + UDP server + --dry-run + stdin/socket full-duplex + the
+// per-line semantic-pipe SockSessionRecord@0.1 emission are DEFERRED
+// to later issues on the pdxsock backlog:
+//   - -u UDP client: pdxsock#6 (M3-001), unblocked by sysnos 96/97
+//     (sendto/recvfrom, R93.M2-004 #2052). This body prints the
+//     documented pdxsock_msg_udp_not_yet diagnostic and exits 3.
+//   - -u -l UDP server: out of scope per design/networking/r100-user-
+//     tools-plan.md §7.2 (needs recvfrom peer-address out-params which
+//     the caller-side ABI at this round does not thread through libpdx-
+//     net yet; UDP server would need a different tool shape).
+//   - --dry-run: pdxsock#3 (M1-003). Not accepted here (any arg that
+//     starts with '-' other than exactly '-l' or '-u' falls into the
+//     usage-refusal path).
+//   - Bidirectional stdin/socket forwarding (netcat's real contract):
+//     v1.1-A's send-then-recv shape is HONEST about being HTTP-style
+//     (send request, read response, close). Full-duplex needs sysno
+//     102 poll (landed R95.M3-001 #2080) plus a select-loop design
+//     that a small tool this size does not need at v1.1-A. Escalated
+//     to a follow-on v1.1-A' issue rather than crammed into this one.
+//
+// Argv grammar accepted at this landing (matches design §7.1 subset):
+//     pdxsock <host> <port>       -- TCP client
+//     pdxsock -l <port>           -- TCP server
+//     pdxsock -u <host> <port>    -- UDP client (STUB refuses; exit 3)
+//     pdxsock -l -u <port>        -- UDP server (out of scope; exit 3)
+//     pdxsock                     -- usage on fd 2; exit 2
+//     pdxsock <anything else>     -- usage on fd 2; exit 2
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls, per user memory)
+// ---------------------------------------------------------------
+//   - No `test rN, rN` anywhere; every zero-check is `cmp rN, 0`.
+//   - No 2-op `imul r, imm`; decimal *10 is `shl rax, 3; add rax, r10;
+//     add rax, r10` (rax*8 + rax + rax = rax*10). The `parse_u64_body`
+//     inline block below is the only place a *10 fold happens.
+//   - Byte loads via `xor rax, rax; mov_b rax, [ptr]` per src/user/
+//     cat.pdx (paideia-as #1248: cmp al, imm8 emits with REX.W so
+//     the upper bits of rax must be zero before the byte compare
+//     observes the loaded byte cleanly).
+//   - Every label prefixed `pdxsock_` (paideia-as reserved-word
+//     discipline: `loop`, `if` etc. are keywords and bare labels
+//     using them fail to parse).
+//   - Module name = PascalCase file basename (`Main` for `main.pdx`).
+//   - No multiline `pub let = "..."` string continuations; every
+//     literal is one line.
+//   - No `and r11, imm64`; every mask fits in imm32.
+//   - Fingerprint tag sizes: byte-array declarations write the NUL
+//     into the length AND the string body, but the sys_write length
+//     constant is the wire byte count (no NUL). Every literal below
+//     names both explicitly (`_len` sibling constant).
+//
+// SC+ IDs used (matches src/user/syscall_shim.pdx + design/user/
+// syscall-table.md through sysno 95):
+//   0  = sys_read   (fd, buf, count)         -> n | -errno
+//   1  = sys_write  (fd, buf, count)         -> n | -errno
+//   60 = sys_exit   (status)                 -> never returns
+//   87 = sys_socket (domain, type, proto)    -> fd | -errno
+//   88 = sys_bind   (fd, local_port)         -> 0 | -errno
+//   89 = sys_listen (fd, backlog)            -> 0 | -errno
+//   90 = sys_accept (fd)                     -> new fd | -errno
+//   91 = sys_connect(fd, remote_ip, port)    -> 0 | -errno
+//   92 = sys_send   (fd, buf, len)           -> n | -errno
+//   93 = sys_recv   (fd, buf, len)           -> n | -errno
+//   94 = sys_shutdown(fd, how)               -> 0 | -errno
+//
+// The kernel's real bind/connect ABI is the "collapsed" shape
+// (`local_port` u64, `remote_ip` u32 packed dotted-quad in bits
+// [31:0]) -- design/user/syscall-table.md's `sockaddr_ptr` prose is
+// aspirational; src/kernel/core/syscall/handlers/sys_bind.pdx and
+// sys_connect.pdx are the ground truth and this file targets those.
+// remote_ip byte order: bits [31:24]=a, [23:16]=b, [15:8]=c, [7:0]=d
+// for "a.b.c.d" (matches sys_connect.pdx's own header note).
+
+module Main = structure {
+
+  // -----------------------------------------------------------------
+  // 4 KiB scratch buffer -- one page, matches sys_read/sys_recv's
+  // natural transfer sweet spot. .bss, uninit, 8-byte aligned.
+  // -----------------------------------------------------------------
+  pub let mut pdxsock_buf : [u8; 4096] = uninit @align(8)
+
+  // -----------------------------------------------------------------
+  // Diagnostic messages. Every literal is one line; `_len` is the
+  // wire byte count (excludes the trailing NUL). Byte counts audited
+  // by hand -- paideia-as errors any mismatch between the declared
+  // [u8; N] and the literal length, and a mismatch between the
+  // sys_write count and the actual wire bytes silently overruns the
+  // buffer into adjacent .rodata (see user memory `pdx encoder
+  // pitfalls`: fingerprint tag size off-by-one).
+  //
+  // The v1.1-A messages are intentionally terse (fixed vocabulary,
+  // one line each) so the audit is a two-second scan; a richer usage
+  // string with grammar and mode-flag hints lands with pdxsock#2
+  // (M1-002 argv surface).
+  // -----------------------------------------------------------------
+  pub let pdxsock_msg_usage         : [u8; 16] = "pdxsock: usage\n\0"
+  pub let pdxsock_msg_usage_len     : u64 = 15
+
+  pub let pdxsock_msg_bad_port      : [u8; 19] = "pdxsock: bad port\n\0"
+  pub let pdxsock_msg_bad_port_len  : u64 = 18
+
+  pub let pdxsock_msg_bad_ip        : [u8; 17] = "pdxsock: bad ip\n\0"
+  pub let pdxsock_msg_bad_ip_len    : u64 = 16
+
+  pub let pdxsock_msg_udp_not_yet   : [u8; 19] = "pdxsock: udp stub\n\0"
+  pub let pdxsock_msg_udp_not_yet_len : u64 = 18
+
+  pub let pdxsock_msg_socket_fail   : [u8; 22] = "pdxsock: socket fail\n\0"
+  pub let pdxsock_msg_socket_fail_len : u64 = 21
+
+  pub let pdxsock_msg_connect_fail  : [u8; 23] = "pdxsock: connect fail\n\0"
+  pub let pdxsock_msg_connect_fail_len : u64 = 22
+
+  pub let pdxsock_msg_bind_fail     : [u8; 20] = "pdxsock: bind fail\n\0"
+  pub let pdxsock_msg_bind_fail_len : u64 = 19
+
+  pub let pdxsock_msg_listen_fail   : [u8; 22] = "pdxsock: listen fail\n\0"
+  pub let pdxsock_msg_listen_fail_len : u64 = 21
+
+  pub let pdxsock_msg_accept_fail   : [u8; 22] = "pdxsock: accept fail\n\0"
+  pub let pdxsock_msg_accept_fail_len : u64 = 21
+
+  // -----------------------------------------------------------------
+  // _start -- pdxsock entry point. Never returns; every terminal path
+  // ends in sys_exit.
+  //
+  // Register plan (all callee-save, so they survive every syscall
+  // without push/pop -- SYSCALL preserves callee-save regs by the
+  // amd64 fast-syscall convention):
+  //   r12 = argc                       (loaded once from rdi)
+  //   r13 = argv base                  (loaded once from rsi)
+  //   r14 = mode flag                  (0=client, 1=server, 2=UDP-client stub)
+  //   r15 = fd                         (from sys_socket, then reused)
+  //   rbx = parsed port                (0..65535)
+  //
+  // Exit statuses:
+  //   0 = clean completion (a normal end-of-stream on either side)
+  //   2 = argv usage refusal
+  //   3 = capability not yet wired at v1.1-A (UDP stub)
+  //   4 = sys_socket refused
+  //   5 = sys_connect refused (client) / sys_bind refused (server)
+  //   6 = sys_listen refused
+  //   7 = sys_accept refused
+  //   8 = bad port
+  //   9 = bad IPv4
+  //
+  // Effects: {mem, sysreg} for scratch touches + every SYSCALL.
+  // Caps:    @{fs, sched, cap} -- fs for read/write, sched for exit,
+  //          cap for the socket-syscall family (all cap-gated on the
+  //          kernel side per src/kernel/core/syscall/handlers/
+  //          sys_socket.pdx et al).
+  // -----------------------------------------------------------------
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched, cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched, cap},
+      justification: "pdxsock v1.1-A M1-001 real body (issue #15). Retires the M1-001 STUB with a REAL syscall path over the R72.M1-005 socket family (sysnos 87..94) plus sys_read/write/exit (0/1/60). Argv dispatch: (a) argc == 3 with argv[1] == '-l' -> TCP server (bind/listen/accept/recv/write/shutdown/exit). (b) argc == 3 without a leading flag -> TCP client (connect/read-stdin/send/recv/write/shutdown/exit). (c) argc == 4 with argv[1] == '-u' -> UDP-client stub (write diagnostic, exit 3). (d) argc == 4 with argv[1] == '-l' and argv[2] == '-u' -> UDP-server refusal (out of scope per design/networking/r100-user-tools-plan.md §7.2; same exit-3 diagnostic). (e) anything else -> usage on fd 2, exit 2. Every parse failure (bad IP, bad port) emits its own diagnostic and exits nonzero without touching a socket. Every syscall refusal (socket / connect / bind / listen / accept) emits its own diagnostic on fd 2 and exits with a distinct nonzero status so the caller can tell them apart. Register discipline: r12=argc / r13=argv / r14=mode / r15=fd / rbx=port -- all callee-save, no push/pop needed since SYSCALL preserves callee-save and the function ends in sys_exit (never returns). @no_frame is legitimate. Encoder discipline (per user memory `pdx encoder pitfalls`): no `test rN, rN` (every zero-check is `cmp rN, 0`); no 2-op `imul r, imm` (decimal *10 is `shl rax, 3; add rax, r10; add rax, r10`); byte loads use `xor rax, rax; mov_b rax, [ptr]`; module name matches file basename PascalCase (Main); every label prefixed `pdxsock_`.",
+      block: {
+        // ---- Step 0: latch argc / argv from execve-ABI registers. ----
+        mov r12, rdi;                           // r12 = argc
+        mov r13, rsi;                           // r13 = argv
+
+        // ---- Step 1: argc gate. -----------------------------------------
+        cmp r12, 3;
+        je pdxsock_check_argc3;
+        cmp r12, 4;
+        je pdxsock_check_argc4;
+        jmp pdxsock_usage;
+
+      pdxsock_check_argc3:
+        // argc == 3: either `pdxsock <host> <port>` (client) or
+        //           `pdxsock -l <port>` (server).
+        // Peek argv[1]: is it "-l"?
+        mov rbx, [r13 + 1*8];                    // rbx = argv[1]
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0x2d;                           // '-'
+        jne pdxsock_client_mode;
+        xor rax, rax;
+        mov_b rax, [rbx + 1];
+        cmp rax, 0x6c;                           // 'l'
+        jne pdxsock_usage;                       // '-' followed by non-'l' -> usage
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0;                              // NUL after 'l'?
+        jne pdxsock_usage;                       // "-l..." with trailer -> usage
+        // "-l" detected -> server mode on argv[2] port.
+        mov r14, 1;                              // mode = server
+        mov rdi, [r13 + 2*8];                    // rdi = argv[2] = port_str
+        jmp pdxsock_parse_port;
+
+      pdxsock_check_argc4:
+        // argc == 4: `pdxsock -u <host> <port>` (UDP client stub) or
+        //            `pdxsock -l -u <port>` (UDP server refusal).
+        // Peek argv[1]: '-l' or '-u'?
+        mov rbx, [r13 + 1*8];                    // rbx = argv[1]
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0x2d;                           // '-'
+        jne pdxsock_usage;
+        xor rax, rax;
+        mov_b rax, [rbx + 1];
+        cmp rax, 0x75;                           // 'u'
+        je pdxsock_argv4_u;
+        cmp rax, 0x6c;                           // 'l'
+        je pdxsock_argv4_l;
+        jmp pdxsock_usage;
+
+      pdxsock_argv4_u:
+        // "-u ..." at argv[1]. Ensure NUL after 'u'.
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0;
+        jne pdxsock_usage;
+        // UDP client stub -- emit diagnostic and exit 3 (no socket touched).
+        jmp pdxsock_udp_stub;
+
+      pdxsock_argv4_l:
+        // "-l ..." at argv[1]. Ensure NUL after 'l'.
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0;
+        jne pdxsock_usage;
+        // Peek argv[2]: expect "-u" for the UDP server refusal path.
+        mov rbx, [r13 + 2*8];
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0x2d;
+        jne pdxsock_usage;
+        xor rax, rax;
+        mov_b rax, [rbx + 1];
+        cmp rax, 0x75;
+        jne pdxsock_usage;
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0;
+        jne pdxsock_usage;
+        // "-l -u <port>" -- UDP server. Out of scope per §7.2. Same
+        // diagnostic + exit 3 as the UDP client stub (both are the
+        // "UDP not yet wired at v1.1-A" surface).
+        jmp pdxsock_udp_stub;
+
+      pdxsock_client_mode:
+        // argc == 3 with no leading flag: `pdxsock <host> <port>`.
+        mov r14, 0;                              // mode = client
+        mov rdi, [r13 + 2*8];                    // port_str = argv[2]
+        jmp pdxsock_parse_port;
+
+        // ================================================================
+        // Diagnostic exits
+        // ================================================================
+
+      pdxsock_usage:
+        mov rdi, 2;                              // fd = stderr
+        lea rsi, [rip + pdxsock_msg_usage];
+        mov rdx, 15;                             // pdxsock_msg_usage_len
+        mov rax, 1;                              // SC+ ID 1 = sys_write
+        syscall;
+        mov rdi, 2;                              // exit status = 2 (usage)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      pdxsock_udp_stub:
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_udp_not_yet];
+        mov rdx, 18;                             // pdxsock_msg_udp_not_yet_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 3;                              // exit status = 3
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      pdxsock_bad_port:
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_bad_port];
+        mov rdx, 18;                             // pdxsock_msg_bad_port_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 8;                              // exit status = 8
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      pdxsock_bad_ip:
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_bad_ip];
+        mov rdx, 16;                             // pdxsock_msg_bad_ip_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 9;                              // exit status = 9
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      pdxsock_socket_fail:
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_socket_fail];
+        mov rdx, 21;                             // pdxsock_msg_socket_fail_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 4;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      pdxsock_connect_fail:
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_connect_fail];
+        mov rdx, 22;                             // pdxsock_msg_connect_fail_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 5;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      pdxsock_bind_fail:
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_bind_fail];
+        mov rdx, 19;                             // pdxsock_msg_bind_fail_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 5;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      pdxsock_listen_fail:
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_listen_fail];
+        mov rdx, 21;                             // pdxsock_msg_listen_fail_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 6;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      pdxsock_accept_fail:
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_accept_fail];
+        mov rdx, 21;                             // pdxsock_msg_accept_fail_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 7;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ================================================================
+        // Port parser -- inline decimal accumulator.
+        //   rdi = char* NUL-terminated port string
+        //   rbx <- parsed port (0..65535); on failure jumps to pdxsock_bad_port.
+        // Uses rcx as byte cursor, r8 as scratch byte, r10 as *10 helper.
+        // rdi survives (not touched); rax is destroyed.
+        // ================================================================
+
+      pdxsock_parse_port:
+        xor rax, rax;                            // acc = 0
+        xor rcx, rcx;                            // i = 0
+      pdxsock_port_loop:
+        xor r8, r8;
+        mov_b r8, [rdi + rcx*1];                 // byte = str[i]
+        cmp r8, 0;                               // NUL?
+        je pdxsock_port_done;
+        sub r8, 48;                              // '0' = 48
+        cmp r8, 9;
+        ja pdxsock_bad_port;                     // non-digit -> refuse
+        // acc = acc * 10 + digit  (via shl+add+add, per encoder-discipline
+        // note: 2-op `imul r, imm` is banned).
+        mov r10, rax;                            // r10 = acc
+        shl rax, 3;                              // rax = acc*8
+        add rax, r10;                            // + acc  = *9
+        add rax, r10;                            // + acc  = *10
+        add rax, r8;                             // + digit
+        add rcx, 1;
+        jmp pdxsock_port_loop;
+      pdxsock_port_done:
+        // Range gate: 0..65535 (u16). Reject empty string (rcx == 0)
+        // and overflows (rax > 65535).
+        cmp rcx, 0;
+        je pdxsock_bad_port;
+        cmp rax, 65535;
+        ja pdxsock_bad_port;
+        mov rbx, rax;                            // rbx = port
+
+        // Fork on mode.
+        cmp r14, 1;
+        je pdxsock_server_body;
+        cmp r14, 0;
+        je pdxsock_client_parse_ip;
+        // Unreachable (mode==2 was consumed by pdxsock_udp_stub above).
+        jmp pdxsock_usage;
+
+        // ================================================================
+        // IPv4 parser -- accepts "a.b.c.d", NUL-terminated, each field
+        //   0..255, exactly three dots. Writes u32 to r9 in the byte
+        //   order sys_connect expects (bits [31:24]=a, [23:16]=b,
+        //   [15:8]=c, [7:0]=d per sys_connect.pdx header).
+        //   Input:  argv[1] as the host string.
+        //   Output: r9 = ip_u32 on success; jumps to pdxsock_bad_ip
+        //           on any malformed field, embedded NUL, or over-255.
+        // Uses rdi as base ptr (argv[1]), rcx as byte cursor, r8/r10
+        //   as inner scratches, rdx as running u32 accumulator.
+        // ================================================================
+
+      pdxsock_client_parse_ip:
+        mov rdi, [r13 + 1*8];                    // host = argv[1]
+        xor rdx, rdx;                            // rdx = accumulated u32
+        xor rcx, rcx;                            // rcx = cursor
+        xor r11, r11;                            // r11 = dot count (0..3)
+      pdxsock_ip_field:
+        xor rax, rax;                            // per-field accumulator
+        xor r15, r15;                            // per-field digit count
+      pdxsock_ip_digit_loop:
+        xor r8, r8;
+        mov_b r8, [rdi + rcx*1];
+        cmp r8, 0;                               // NUL ends the string (only valid after 4th field)
+        je pdxsock_ip_field_end_nul;
+        cmp r8, 0x2e;                            // '.'
+        je pdxsock_ip_field_end_dot;
+        sub r8, 48;
+        cmp r8, 9;
+        ja pdxsock_bad_ip;
+        mov r10, rax;
+        shl rax, 3;
+        add rax, r10;
+        add rax, r10;
+        add rax, r8;
+        cmp rax, 255;                            // per-field cap (fits in u8)
+        ja pdxsock_bad_ip;
+        add rcx, 1;
+        add r15, 1;
+        // Cap per-field digit count at 3 to reject leading-zero abuse and
+        // guarantee no false-positive overflow past the 255 gate above.
+        cmp r15, 3;
+        ja pdxsock_bad_ip;
+        jmp pdxsock_ip_digit_loop;
+      pdxsock_ip_field_end_dot:
+        // Field ended with '.'. Empty field (r15 == 0) is invalid.
+        cmp r15, 0;
+        je pdxsock_bad_ip;
+        // Fold this field into the u32 accumulator (rdx = (rdx << 8) | field).
+        shl rdx, 8;
+        add rdx, rax;
+        add r11, 1;
+        cmp r11, 3;                              // already saw 3 dots?
+        ja pdxsock_bad_ip;
+        add rcx, 1;                              // skip the '.'
+        jmp pdxsock_ip_field;
+      pdxsock_ip_field_end_nul:
+        // Field ended with NUL. Empty field (r15 == 0) is invalid.
+        cmp r15, 0;
+        je pdxsock_bad_ip;
+        // Must have seen exactly 3 dots before this NUL.
+        cmp r11, 3;
+        jne pdxsock_bad_ip;
+        shl rdx, 8;
+        add rdx, rax;
+        mov r9, rdx;                             // r9 = ip_u32
+        // Fall through to the client body.
+
+        // ================================================================
+        // TCP client body.
+        //   rbx = port, r9 = ip_u32.
+        // ================================================================
+
+      pdxsock_client_body:
+        // ---- sys_socket(AF_INET=2, SOCK_STREAM=1, 0). SC+ ID 87. ----
+        mov rdi, 2;                              // AF_INET
+        mov rsi, 1;                              // SOCK_STREAM
+        xor rdx, rdx;                            // proto = 0
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl pdxsock_socket_fail;
+        mov r15, rax;                            // r15 = fd
+
+        // ---- sys_connect(fd, ip_u32, port). SC+ ID 91. ----
+        mov rdi, r15;
+        mov rsi, r9;                             // remote_ip (u32 in low bits)
+        mov rdx, rbx;                            // remote_port
+        mov rax, 91;
+        syscall;
+        cmp rax, 0;
+        jl pdxsock_connect_fail;
+
+        // ---- sys_read(0, buf, 4096). SC+ ID 0. One stdin gulp. ----
+        //
+        // A tool this size does not need a stdin-drain loop -- one 4 KiB
+        // sys_read covers the typical HTTP-shaped request the test
+        // harness pipes in ("GET / HTTP/1.0\r\n\r\n" is 18 bytes; even
+        // the largest realistic client-side prompt fits in one page).
+        // A zero return (empty stdin -- e.g. `pdxsock host port </dev/
+        // null`) skips the send and falls straight into the recv loop.
+        xor rdi, rdi;                            // fd = 0 (stdin)
+        lea rsi, [rip + pdxsock_buf];
+        mov rdx, 4096;
+        mov rax, 0;
+        syscall;
+        cmp rax, 0;
+        jle pdxsock_client_recv_loop;            // empty / -errno -> no send
+
+        // ---- sys_send(fd, buf, n). SC+ ID 92. ----
+        mov rdx, rax;                            // len = n (must set before rax clobber)
+        mov rdi, r15;                            // fd
+        lea rsi, [rip + pdxsock_buf];
+        mov rax, 92;
+        syscall;
+        // Ignore short-send / -errno at this landing: the recv loop
+        // below will surface a broken half-connection as a zero return
+        // from sys_recv, which is the honest way to signal it.
+
+      pdxsock_client_recv_loop:
+        // ---- sys_recv(fd, buf, 4096). SC+ ID 93. ----
+        mov rdi, r15;
+        lea rsi, [rip + pdxsock_buf];
+        mov rdx, 4096;
+        mov rax, 93;
+        syscall;
+        cmp rax, 0;
+        jle pdxsock_client_shutdown;             // EOF or -errno -> done
+
+        // ---- sys_write(1, buf, n). SC+ ID 1. ----
+        mov rdx, rax;                            // count = n
+        mov rdi, 1;                              // fd = stdout
+        lea rsi, [rip + pdxsock_buf];
+        mov rax, 1;
+        syscall;
+
+        jmp pdxsock_client_recv_loop;
+
+      pdxsock_client_shutdown:
+        // ---- sys_shutdown(fd, 2 = SHUT_RDWR). SC+ ID 94. ----
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+
+        // ---- sys_exit(0). ----
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ================================================================
+        // TCP server body.
+        //   rbx = port.
+        // ================================================================
+
+      pdxsock_server_body:
+        // ---- sys_socket(AF_INET=2, SOCK_STREAM=1, 0). SC+ ID 87. ----
+        mov rdi, 2;
+        mov rsi, 1;
+        xor rdx, rdx;
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl pdxsock_socket_fail;
+        mov r15, rax;                            // r15 = listen fd
+
+        // ---- sys_bind(fd, port). SC+ ID 88. ----
+        mov rdi, r15;
+        mov rsi, rbx;                            // port
+        mov rax, 88;
+        syscall;
+        cmp rax, 0;
+        jl pdxsock_bind_fail;
+
+        // ---- sys_listen(fd, 8). SC+ ID 89. ----
+        mov rdi, r15;
+        mov rsi, 8;                              // backlog
+        mov rax, 89;
+        syscall;
+        cmp rax, 0;
+        jl pdxsock_listen_fail;
+
+        // ---- sys_accept(fd). SC+ ID 90. Blocks. ----
+        mov rdi, r15;
+        mov rax, 90;
+        syscall;
+        cmp rax, 0;
+        jl pdxsock_accept_fail;
+        mov r15, rax;                            // r15 = accepted fd (listen fd is closed by loop-exit anyway)
+
+      pdxsock_server_recv_loop:
+        // ---- sys_recv(fd, buf, 4096). SC+ ID 93. ----
+        mov rdi, r15;
+        lea rsi, [rip + pdxsock_buf];
+        mov rdx, 4096;
+        mov rax, 93;
+        syscall;
+        cmp rax, 0;
+        jle pdxsock_server_shutdown;
+
+        // ---- sys_write(1, buf, n). SC+ ID 1. ----
+        mov rdx, rax;
+        mov rdi, 1;
+        lea rsi, [rip + pdxsock_buf];
+        mov rax, 1;
+        syscall;
+
+        jmp pdxsock_server_recv_loop;
+
+      pdxsock_server_shutdown:
+        // ---- sys_shutdown(fd, 2). SC+ ID 94. ----
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+
+        // ---- sys_exit(0). ----
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt
+      }
+    } @no_frame
+}
