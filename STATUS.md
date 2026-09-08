@@ -2,11 +2,16 @@
 
 **Wave:** R100 (user-space networking tools -- paideia-os
 `design/networking/r100-user-tools-plan.md` §7).
-**Current milestone:** v1.1-B (semantic-pipe emission wire:
-SockSessionRecord@0.1 via sys_semantic_send SC+ ID 115) -- **landed**.
-Previous: v1.1-A (real-body extraction; real socket-syscall path) --
-landed.
-**Version:** 0.1.0-dev (pre-tag; a signed 1.0.0 release closes at M5).
+**Overall status:** **v1.1.0 released** (2026-09-08).
+**Current milestone:** v1.1-C (release closer: `manifest.pdxproj`
+promoted to 1.1.0, CHANGELOG.md `[1.1.0]` section landed, STATUS.md
+overall status flipped, `v1.1.0` tag cut) -- **landed**.
+Previous: v1.1-B (semantic-pipe emission wire: `SockSessionRecord@0.1`
+via `sys_semantic_send` SC+ ID 115) -- landed.
+Before that: v1.1-A (real-body extraction; real socket-syscall path
+over sysnos 87..94) -- landed.
+**Version:** 1.1.0 (tag `v1.1.0`, unsigned source tag; the dual-signed
+release-manifest ship path lands at M5-001 as v1.2.0-signed).
 
 See `design/networking/r100-user-tools-plan.md` §13.6 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the

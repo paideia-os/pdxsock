@@ -1,0 +1,82 @@
+# pdxsock -- paideia-as build manifest
+#
+# Wave: R100  Milestone: v1.1-C (release closer -- v1.1.0 tag)
+# Doc:  design/networking/r100-user-tools-plan.md §7 (paideia-os repo).
+#
+# Consumed by `paideia-as build` (release-time signer path) and by the
+# tools/build.sh iterator (`src/*.pdx` glob) at day-to-day build time.
+# paideia-as v0.36.0 is the toolchain floor (see tools/build.sh); the
+# release-time ML-DSA-65 signer at M5-001 will additionally require
+# paideia-as v0.33-crypto-kdf per paideia-os design/release-manifest.md.
+#
+# The v1.1.0 release closes issues pdxsock#1 (M1-001 scaffold + caps.decl),
+# pdxsock#15 (v1.1-A: real TCP client + server bodies), pdxsock#16 (v1.1-B:
+# SockSessionRecord@0.1 semantic-pipe emit wire) and pdxsock#17 (v1.1-C:
+# this release closer). The signed 1.0-shape release originally planned at
+# M5 is superseded by v1.1.0 -- v1.1-A landed real socket bodies and v1.1-B
+# landed the semantic-pipe emission, both of which the original 1.0 plan
+# treated as post-1.0 milestones; the tag jumps to 1.1.0 rather than
+# regressing 1.1-shape code under a 1.0 tag.
+
+name        = pdxsock
+version     = 1.1.0
+kind        = tool
+entry       = _start                    # src/main.pdx
+output      = build-out/pdxsock.elf
+caps_decl   = caps.decl
+
+# --- Source list (order-insensitive; paideia-as resolves module deps
+# from `module <Basename> = structure { ... }` headers). At v1.1.0 the
+# entire tool is a single .pdx (`_start` + inlined argv scanner + TCP
+# client and server bodies + SockSessionRecord@0.1 emission wire).
+# M1-002 (#2, argv scanner move to src/argv.pdx) will split this out
+# post-1.1.0 without touching the tag surface.
+sources:
+  - src/main.pdx                  # v1.1-A + v1.1-B: TCP client/server + semantic-pipe emit
+
+# --- Library dependencies ----------------------------------------------
+# pdxsock at v1.1.0 depends on nothing outside the SC+ syscall floor
+# (sysnos 87..94 for socket/bind/listen/accept/connect/send/recv/shutdown
+# + 0/1/60 for read/write/exit + 115 for sys_semantic_send). libpdx-net
+# is not consumed at v1.1.0 -- the client and server bodies call the
+# SC+ syscall stubs inline. libpdx-audit is deferred to M3-002 (audit_id
+# threading through SockSessionRecord). libpdx-argv is deferred to
+# M1-002 (argv scanner extraction).
+deps: []
+
+# --- Test targets ------------------------------------------------------
+# QEMU-substrate smokes are deferred to M4 (pdxsock#7..#10). No golden-
+# fingerprint tests at v1.1.0 -- the tool is exercised end-to-end at
+# paideia-os smoke time via the /bin seeding pipeline (paideia-os
+# issues #1976/#1977).
+tests: []
+
+# --- Documentation targets ---------------------------------------------
+# .pdxdoc source for `doc pdxsock` lands at M5-001 alongside the
+# dual-signed release manifest. v1.1.0 ships with README.md +
+# STATUS.md + CHANGELOG.md only.
+docs: []
+
+# --- Paideia-as compliance flags ---------------------------------------
+# These mirror the invariants src/main.pdx is written against. A build
+# under a paideia-as revision that does not honour every flag below
+# should refuse fast rather than silently mis-encode.
+compliance:
+  - module-basename-pascal        # Module <BasenamePascalCase>, no dir prefix
+  - no-test-mnemonic              # zero-check via cmp reg, 0
+  - cmp-imm32-only                # cmp reg, imm <= 0x7FFFFFFF; else stage via r11
+  - r11-scratch                   # r11 is not preserved across calls
+  - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
+  - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
+
+# --- Release policy ----------------------------------------------------
+# v1.1.0 is an unsigned source-tag release: the v1.0-shape dual-signed
+# release-manifest ship path (paideia-os design/release-manifest.md +
+# design/mirror-push.md) lands at M5-001 (pdxsock#11) as a v1.2.0-signed
+# follow-on rather than a re-sign of v1.1.0. This keeps the semantic-
+# pipe emit wire + real socket bodies tagged and reachable now, without
+# blocking on the release-time crypto pipeline (paideia-as v0.33-crypto-
+# kdf signer + paideia-root re-sign + pkgs.paideia-os mirror hand-off).
+release:
+  signer_author  = unsigned              # v1.1.0 unsigned; dual-sign at M5-001
+  mirror_target  = (deferred)            # pkgs.paideia-os/main/pdxsock/1.2.0/ at M5-001

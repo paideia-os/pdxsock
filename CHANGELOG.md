@@ -5,7 +5,32 @@ changelog-style, semver-ordered, newest first.
 
 ## [Unreleased]
 
+_No unreleased changes -- v1.1.0 is the current tag._
+
+## [1.1.0] - 2026-09-08
+
+First tagged release. Closes pdxsock#1 (M1-001 scaffold + caps.decl),
+pdxsock#15 (v1.1-A: real TCP client + server bodies), pdxsock#16
+(v1.1-B: `SockSessionRecord@0.1` semantic-pipe emit wire) and
+pdxsock#17 (v1.1-C: this release closer). The signed v1.0-shape
+release path originally planned at M5 is superseded by v1.1.0 -- v1.1-A
+landed real socket bodies and v1.1-B landed the semantic-pipe emission,
+both of which the original 1.0 plan treated as post-1.0 milestones;
+the tag jumps to 1.1.0 rather than regressing 1.1-shape code under a
+1.0 tag. The dual-signed release-manifest ship path (paideia-os
+design/release-manifest.md + design/mirror-push.md) lands at M5-001
+(pdxsock#11) as a v1.2.0-signed follow-on rather than a re-sign of
+v1.1.0.
+
 ### Added
+- **v1.1-C (issue #17) -- release closer.** `manifest.pdxproj` at
+  version 1.1.0 (single-source `src/main.pdx`, no deps, no tests,
+  no docs, unsigned release-policy stanza documenting the v1.2.0
+  signed-follow-on plan); CHANGELOG.md `[1.1.0] - 2026-09-08`
+  section (this entry) promoting the [Unreleased] v1.1-A + v1.1-B
+  entries; STATUS.md v1.1-C landed + overall status "v1.1.0
+  released". Release tag `v1.1.0` cut from this commit.
+
 - **v1.1-B (issue #16) -- semantic-pipe emission wire.** Every
   completed TCP connection (both `pdxsock <host> <port>` client and
   `pdxsock -l <port>` server paths) now emits a 40-byte
