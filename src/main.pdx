@@ -1,4 +1,4 @@
-// src/main.pdx -- pdxsock v1.1-A M1-001 real body (issue #15).
+// src/main.pdx -- pdxsock v1.1-A/B real body (issues #15, #16).
 //
 // pdxsock: netcat-adjacent general TCP/UDP client + server. This file
 // is the ring-3 ELF entry point (`_start`), argv-wired per the frozen
@@ -33,9 +33,63 @@
 //     sys_shutdown(new_fd, 2)                  SC+ ID 94
 //     sys_exit(0)                              SC+ ID 60
 //
-// UDP client + UDP server + --dry-run + stdin/socket full-duplex + the
-// per-line semantic-pipe SockSessionRecord@0.1 emission are DEFERRED
-// to later issues on the pdxsock backlog:
+// v1.1-B "semantic-pipe emission wire" scope (issue #16)
+// -------------------------------------------------------
+// Adds SockSessionRecord@0.1 emission at end of every completed
+// connection (client or server), via sys_semantic_send (SC+ ID 115,
+// paideia-os handler landed at R107-M0-001 #2350).
+//
+// Record shape (40 bytes, @align(8), fits in the sysno-115 240-byte
+// per-slot cap with 200 bytes of headroom for future fields):
+//
+//   [ +0]  bytes_in         u64   -- socket->local octets (sys_recv sum)
+//   [ +8]  bytes_out        u64   -- local->socket octets (sys_send sum);
+//                                    always 0 in server mode at v1.1-B
+//                                    (the server body writes stdout only)
+//   [+16]  peer_ip_port_mode u64  -- packed:
+//                                     bits [ 0..31] = peer_ip u32 (server=0
+//                                                    since sys_accept at
+//                                                    v1.1-A does not thread
+//                                                    an out-address)
+//                                     bits [32..47] = peer_port u16
+//                                     bits [48..55] = mode      u8 (0=client,
+//                                                                   1=server)
+//                                     bits [56..63] = reserved  u8 (0)
+//   [+24]  session_start_ns u64   -- rdtsc snapshot taken right AFTER
+//                                    sys_connect (client) or sys_accept
+//                                    (server) returns success
+//   [+32]  session_end_ns   u64   -- rdtsc snapshot taken at recv-loop exit
+//                                    (either EOF or -errno) just before
+//                                    sys_semantic_send + sys_shutdown
+//
+// Timestamp caveat: at v1.1-B these are raw TSC samples (cycles), NOT
+// nanoseconds. There is no user-facing sys_clock_now yet; the design
+// name "_ns" is preserved for schema-shape stability across a future
+// re-land that converts to ns once the syscall exists. Consumers can
+// compute a monotonic duration = (end - start) TSC ticks; converting
+// to wall-time ns needs a per-host TSC frequency the kernel does not
+// yet publish. This mirrors src/kernel/core/fs/pdxfs_lite/write.pdx's
+// "monotonic-lookalike (rdtsc sample)" precedent (R25-M2-005 #919).
+//
+// Schema tag: 0x536F636B53657301 -- an ASCII-mnemonic ("SockSes"+ver01)
+// stable u64 fingerprint for SockSessionRecord@0.1 chosen ad-hoc at
+// v1.1-B and preserved verbatim once paideia-os#2000 (schema registry)
+// lands (the registry is additive over these constants). Grep-friendly
+// per `design/networking/r100-user-tools-plan.md` §10 note that "every
+// wave binds a schema fingerprint constant" pre-registry.
+//
+// No cap slot: sys_semantic_send takes no {cap} (kernel-side confirmed
+// at src/kernel/core/syscall/handlers/sys_semantic_send.pdx line 158).
+// KIND_IPC_ENDPOINT in caps.decl remains optional documentation for a
+// future KIND_SEMANTIC_PIPE recv-side cap, not a v1.1-B admit gate.
+//
+// Emit points: exactly one record per completed connection. Failure
+// paths BEFORE the recv loop (socket / connect / bind / listen /
+// accept refusals, argv usage, bad port, bad ip) emit nothing -- there
+// is no session to describe.
+//
+// UDP client + UDP server + --dry-run + stdin/socket full-duplex are
+// DEFERRED to later issues on the pdxsock backlog:
 //   - -u UDP client: pdxsock#6 (M3-001), unblocked by sysnos 96/97
 //     (sendto/recvfrom, R93.M2-004 #2052). This body prints the
 //     documented pdxsock_msg_udp_not_yet diagnostic and exits 3.
@@ -84,18 +138,19 @@
 //     names both explicitly (`_len` sibling constant).
 //
 // SC+ IDs used (matches src/user/syscall_shim.pdx + design/user/
-// syscall-table.md through sysno 95):
-//   0  = sys_read   (fd, buf, count)         -> n | -errno
-//   1  = sys_write  (fd, buf, count)         -> n | -errno
-//   60 = sys_exit   (status)                 -> never returns
-//   87 = sys_socket (domain, type, proto)    -> fd | -errno
-//   88 = sys_bind   (fd, local_port)         -> 0 | -errno
-//   89 = sys_listen (fd, backlog)            -> 0 | -errno
-//   90 = sys_accept (fd)                     -> new fd | -errno
-//   91 = sys_connect(fd, remote_ip, port)    -> 0 | -errno
-//   92 = sys_send   (fd, buf, len)           -> n | -errno
-//   93 = sys_recv   (fd, buf, len)           -> n | -errno
-//   94 = sys_shutdown(fd, how)               -> 0 | -errno
+// syscall-table.md through sysno 115):
+//   0   = sys_read          (fd, buf, count)         -> n | -errno
+//   1   = sys_write         (fd, buf, count)         -> n | -errno
+//   60  = sys_exit          (status)                 -> never returns
+//   87  = sys_socket        (domain, type, proto)    -> fd | -errno
+//   88  = sys_bind          (fd, local_port)         -> 0 | -errno
+//   89  = sys_listen        (fd, backlog)            -> 0 | -errno
+//   90  = sys_accept        (fd)                     -> new fd | -errno
+//   91  = sys_connect       (fd, remote_ip, port)    -> 0 | -errno
+//   92  = sys_send          (fd, buf, len)           -> n | -errno
+//   93  = sys_recv          (fd, buf, len)           -> n | -errno
+//   94  = sys_shutdown      (fd, how)                -> 0 | -errno
+//   115 = sys_semantic_send (schema, rec_ptr, rec_len) -> 0 | -errno   (v1.1-B)
 //
 // The kernel's real bind/connect ABI is the "collapsed" shape
 // (`local_port` u64, `remote_ip` u32 packed dotted-quad in bits
@@ -155,17 +210,51 @@ module Main = structure {
   pub let pdxsock_msg_accept_fail_len : u64 = 21
 
   // -----------------------------------------------------------------
+  // v1.1-B semantic-pipe record buffer + supporting state (issue #16).
+  //
+  // pdxsock_record_buf holds the marshalled SockSessionRecord@0.1
+  // (40 bytes, layout in the file header). @align(8) so every u64
+  // store is naturally aligned. .bss-resident (uninit); every field is
+  // overwritten at emit time, so the initial contents are irrelevant.
+  //
+  // pdxsock_session_start_ns caches the rdtsc snapshot taken right
+  // after sys_connect (client) / sys_accept (server) returns success,
+  // so the emit block can read it back into a register without holding
+  // it in a scarce callee-save across the entire recv loop. .bss with
+  // = 0 initializer (matches src/kernel/core/syscall/handlers/
+  // sys_semantic_send.pdx's _semantic_ring_head declaration).
+  //
+  // pdxsock_schema_sock_session is the schema fingerprint the kernel
+  // stores verbatim into the ring slot's schema u64. Grep-searchable
+  // constant; see the file header for the ASCII-mnemonic derivation.
+  // -----------------------------------------------------------------
+  pub let mut pdxsock_record_buf         : [u8; 40] = uninit @align(8)
+  pub let mut pdxsock_session_start_ns   : u64      = 0
+  pub let pdxsock_schema_sock_session    : u64      = 0x536F636B53657301
+
+  // -----------------------------------------------------------------
   // _start -- pdxsock entry point. Never returns; every terminal path
   // ends in sys_exit.
   //
   // Register plan (all callee-save, so they survive every syscall
   // without push/pop -- SYSCALL preserves callee-save regs by the
   // amd64 fast-syscall convention):
-  //   r12 = argc                       (loaded once from rdi)
-  //   r13 = argv base                  (loaded once from rsi)
+  //   r12 = argc     (Step 0..argv parse) then bytes_in accumulator (v1.1-B)
+  //   r13 = argv base (Step 0..argv parse) then bytes_out accumulator (v1.1-B)
   //   r14 = mode flag                  (0=client, 1=server, 2=UDP-client stub)
-  //   r15 = fd                         (from sys_socket, then reused)
-  //   rbx = parsed port                (0..65535)
+  //   r15 = fd                         (from sys_socket / sys_accept)
+  //   rbx = parsed port                (0..65535); also carried into the
+  //                                     v1.1-B emit record
+  //   rbp = peer_ip u32 (v1.1-B; 0 in server mode). Callee-save; @no_frame
+  //         means the function does not use rbp as a frame pointer, so
+  //         it is free for our own use.
+  //
+  // r12/r13 flip-role at the entry to pdxsock_client_body /
+  // pdxsock_server_body: they are re-initialised to 0 there, since
+  // their argv-time contents are no longer needed after the mode has
+  // been picked. rbp is written once (in the client body, from the
+  // ip-parser's r9 output; xor'd to 0 in the server body) and read
+  // once (at emit time).
   //
   // Exit statuses:
   //   0 = clean completion (a normal end-of-stream on either side)
@@ -188,7 +277,7 @@ module Main = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched, cap},
-      justification: "pdxsock v1.1-A M1-001 real body (issue #15). Retires the M1-001 STUB with a REAL syscall path over the R72.M1-005 socket family (sysnos 87..94) plus sys_read/write/exit (0/1/60). Argv dispatch: (a) argc == 3 with argv[1] == '-l' -> TCP server (bind/listen/accept/recv/write/shutdown/exit). (b) argc == 3 without a leading flag -> TCP client (connect/read-stdin/send/recv/write/shutdown/exit). (c) argc == 4 with argv[1] == '-u' -> UDP-client stub (write diagnostic, exit 3). (d) argc == 4 with argv[1] == '-l' and argv[2] == '-u' -> UDP-server refusal (out of scope per design/networking/r100-user-tools-plan.md §7.2; same exit-3 diagnostic). (e) anything else -> usage on fd 2, exit 2. Every parse failure (bad IP, bad port) emits its own diagnostic and exits nonzero without touching a socket. Every syscall refusal (socket / connect / bind / listen / accept) emits its own diagnostic on fd 2 and exits with a distinct nonzero status so the caller can tell them apart. Register discipline: r12=argc / r13=argv / r14=mode / r15=fd / rbx=port -- all callee-save, no push/pop needed since SYSCALL preserves callee-save and the function ends in sys_exit (never returns). @no_frame is legitimate. Encoder discipline (per user memory `pdx encoder pitfalls`): no `test rN, rN` (every zero-check is `cmp rN, 0`); no 2-op `imul r, imm` (decimal *10 is `shl rax, 3; add rax, r10; add rax, r10`); byte loads use `xor rax, rax; mov_b rax, [ptr]`; module name matches file basename PascalCase (Main); every label prefixed `pdxsock_`.",
+      justification: "pdxsock v1.1-A M1-001 real body (issue #15) + v1.1-B semantic-pipe emission wire (issue #16). Retires the M1-001 STUB with a REAL syscall path over the R72.M1-005 socket family (sysnos 87..94) plus sys_read/write/exit (0/1/60), and at v1.1-B additionally emits SockSessionRecord@0.1 via sys_semantic_send (SC+ ID 115, R107-M0-001 #2350) at the end of every completed TCP connection (both client and server paths). Argv dispatch: (a) argc == 3 with argv[1] == '-l' -> TCP server (bind/listen/accept/recv/write/emit/shutdown/exit). (b) argc == 3 without a leading flag -> TCP client (connect/read-stdin/send/recv/write/emit/shutdown/exit). (c) argc == 4 with argv[1] == '-u' -> UDP-client stub (write diagnostic, exit 3). (d) argc == 4 with argv[1] == '-l' and argv[2] == '-u' -> UDP-server refusal (out of scope per design/networking/r100-user-tools-plan.md §7.2; same exit-3 diagnostic). (e) anything else -> usage on fd 2, exit 2. Every parse failure (bad IP, bad port) emits its own diagnostic and exits nonzero without touching a socket. Every syscall refusal (socket / connect / bind / listen / accept) emits its own diagnostic on fd 2 and exits with a distinct nonzero status so the caller can tell them apart -- and emits NO SockSessionRecord (no session to describe). v1.1-B session-accounting state: r12=bytes_in (u64 accum over sys_recv returns), r13=bytes_out (u64 accum over sys_send returns; server=0), rbp=peer_ip (u32; server=0), rbx=port carried from parse, r14=mode, r15=fd; pdxsock_session_start_ns @ .bss caches an rdtsc snapshot taken post-connect (client) / post-accept (server); pdxsock_record_buf (40B, @align(8)) marshals {bytes_in, bytes_out, peer_ip|port|mode packed, session_start_ns, session_end_ns} before the sysno-115 call. Timestamp caveat: session_{start,end}_ns are raw TSC ticks not ns until sys_clock_now lands -- schema-shape stable, precedent src/kernel/core/fs/pdxfs_lite/write.pdx (R25-M2-005 #919). Register discipline (revised for v1.1-B): r12/r13 flip from argc/argv (argv-parse phase) to bytes_in/bytes_out (post-parse phase); rbp is newly used as peer_ip and is legitimate under @no_frame (function is leaf-adjacent, never returns). All state carried in callee-save registers survives every SYSCALL by the amd64 fast-syscall convention. rcx and r11 are SYSCALL-clobbered per that same convention; the emit block uses them only for record-field assembly BEFORE each syscall, never reads them after. sys_semantic_send's return (0 / -EFAULT / -EINVAL) is intentionally discarded: the connection is over, and a failure here is a marshalling bug in this file (40-byte record within the [1,240] cap, static rip-relative record_ptr never fails user_ptr_ok) rather than a per-run condition the caller can act on. Encoder discipline (per user memory `pdx encoder pitfalls`): no `test rN, rN` (every zero-check is `cmp rN, 0`); no 2-op `imul r, imm` (decimal *10 is `shl rax, 3; add rax, r10; add rax, r10`); byte loads use `xor rax, rax; mov_b rax, [ptr]`; module name matches file basename PascalCase (Main); every label prefixed `pdxsock_`. New encoder patterns exercised by v1.1-B: `rdtsc` + `shl rdx, 32` + `or rax, rdx` (TSC reconstruction, proven at src/kernel/core/fs/pdxfs_lite/uuid.pdx); `mov [rip + label], reg` and `mov reg, [rip + label]` (rip-relative u64 stores/loads, proven at sys_semantic_send.pdx line 214); `mov r64, imm64` movabs for the 8-byte schema constant (proven at sys_semantic_send.pdx line 221 for errno constants); `add r64, r64` accumulation into r12/r13.",
       block: {
         // ---- Step 0: latch argc / argv from execve-ABI registers. ----
         mov r12, rdi;                           // r12 = argc
@@ -205,7 +294,7 @@ module Main = structure {
         // argc == 3: either `pdxsock <host> <port>` (client) or
         //           `pdxsock -l <port>` (server).
         // Peek argv[1]: is it "-l"?
-        mov rbx, [r13 + 1*8];                    // rbx = argv[1]
+        mov rbx, [r13 + 8];                    // rbx = argv[1]
         xor rax, rax;
         mov_b rax, [rbx];
         cmp rax, 0x2d;                           // '-'
@@ -220,14 +309,14 @@ module Main = structure {
         jne pdxsock_usage;                       // "-l..." with trailer -> usage
         // "-l" detected -> server mode on argv[2] port.
         mov r14, 1;                              // mode = server
-        mov rdi, [r13 + 2*8];                    // rdi = argv[2] = port_str
+        mov rdi, [r13 + 16];                    // rdi = argv[2] = port_str
         jmp pdxsock_parse_port;
 
       pdxsock_check_argc4:
         // argc == 4: `pdxsock -u <host> <port>` (UDP client stub) or
         //            `pdxsock -l -u <port>` (UDP server refusal).
         // Peek argv[1]: '-l' or '-u'?
-        mov rbx, [r13 + 1*8];                    // rbx = argv[1]
+        mov rbx, [r13 + 8];                    // rbx = argv[1]
         xor rax, rax;
         mov_b rax, [rbx];
         cmp rax, 0x2d;                           // '-'
@@ -256,7 +345,7 @@ module Main = structure {
         cmp rax, 0;
         jne pdxsock_usage;
         // Peek argv[2]: expect "-u" for the UDP server refusal path.
-        mov rbx, [r13 + 2*8];
+        mov rbx, [r13 + 16];
         xor rax, rax;
         mov_b rax, [rbx];
         cmp rax, 0x2d;
@@ -277,7 +366,7 @@ module Main = structure {
       pdxsock_client_mode:
         // argc == 3 with no leading flag: `pdxsock <host> <port>`.
         mov r14, 0;                              // mode = client
-        mov rdi, [r13 + 2*8];                    // port_str = argv[2]
+        mov rdi, [r13 + 16];                    // port_str = argv[2]
         jmp pdxsock_parse_port;
 
         // ================================================================
@@ -441,7 +530,7 @@ module Main = structure {
         // ================================================================
 
       pdxsock_client_parse_ip:
-        mov rdi, [r13 + 1*8];                    // host = argv[1]
+        mov rdi, [r13 + 8];                    // host = argv[1]
         xor rdx, rdx;                            // rdx = accumulated u32
         xor rcx, rcx;                            // rcx = cursor
         xor r11, r11;                            // r11 = dot count (0..3)
@@ -512,14 +601,33 @@ module Main = structure {
         jl pdxsock_socket_fail;
         mov r15, rax;                            // r15 = fd
 
+        // v1.1-B: latch peer_ip into callee-save rbp BEFORE sys_connect,
+        // since sys_connect's SYSCALL scratches r9 (caller-save). rbp
+        // survives every subsequent syscall and is read once at emit
+        // time; the ip-parser's r9 output would otherwise not reach the
+        // emit block.
+        mov rbp, r9;                             // peer_ip -> rbp
+
         // ---- sys_connect(fd, ip_u32, port). SC+ ID 91. ----
         mov rdi, r15;
-        mov rsi, r9;                             // remote_ip (u32 in low bits)
+        mov rsi, rbp;                            // remote_ip (from rbp)
         mov rdx, rbx;                            // remote_port
         mov rax, 91;
         syscall;
         cmp rax, 0;
         jl pdxsock_connect_fail;
+
+        // v1.1-B: session accounting starts NOW (post-connect success).
+        // r12 = bytes_in, r13 = bytes_out (both u64 accumulators over the
+        // life of the connection). rdtsc snapshot into
+        // pdxsock_session_start_ns (see file header on the ns / TSC-tick
+        // caveat -- schema-shape stable, semantics are cycle counts).
+        xor r12, r12;                            // bytes_in  = 0
+        xor r13, r13;                            // bytes_out = 0
+        rdtsc;                                   // EDX:EAX = TSC
+        shl rdx, 32;                             // reconstruct u64 in rax
+        or rax, rdx;
+        mov [rip + pdxsock_session_start_ns], rax;
 
         // ---- sys_read(0, buf, 4096). SC+ ID 0. One stdin gulp. ----
         //
@@ -543,9 +651,13 @@ module Main = structure {
         lea rsi, [rip + pdxsock_buf];
         mov rax, 92;
         syscall;
-        // Ignore short-send / -errno at this landing: the recv loop
-        // below will surface a broken half-connection as a zero return
-        // from sys_recv, which is the honest way to signal it.
+        // v1.1-B: track bytes_out on success (rax >= 0). On -errno we
+        // still enter the recv loop (v1.1-A shape: a broken half-connection
+        // surfaces as recv-side EOF); we simply do not inflate the
+        // bytes_out accumulator with a negative errno-as-u64 value.
+        cmp rax, 0;
+        jl pdxsock_client_recv_loop;             // -errno -> skip add, still recv
+        add r13, rax;                            // bytes_out += n
 
       pdxsock_client_recv_loop:
         // ---- sys_recv(fd, buf, 4096). SC+ ID 93. ----
@@ -555,7 +667,12 @@ module Main = structure {
         mov rax, 93;
         syscall;
         cmp rax, 0;
-        jle pdxsock_client_shutdown;             // EOF or -errno -> done
+        jle pdxsock_emit_session_and_exit;       // EOF or -errno -> emit + close
+
+        // v1.1-B: bytes_in += n. Placed BEFORE the sys_write so a
+        // subsequent stdout write error does not skip the accounting
+        // (the record is about the socket-side traffic, not stdout).
+        add r12, rax;
 
         // ---- sys_write(1, buf, n). SC+ ID 1. ----
         mov rdx, rax;                            // count = n
@@ -565,19 +682,6 @@ module Main = structure {
         syscall;
 
         jmp pdxsock_client_recv_loop;
-
-      pdxsock_client_shutdown:
-        // ---- sys_shutdown(fd, 2 = SHUT_RDWR). SC+ ID 94. ----
-        mov rdi, r15;
-        mov rsi, 2;
-        mov rax, 94;
-        syscall;
-
-        // ---- sys_exit(0). ----
-        xor rdi, rdi;
-        mov rax, 60;
-        syscall;
-        hlt;
 
         // ================================================================
         // TCP server body.
@@ -619,6 +723,20 @@ module Main = structure {
         jl pdxsock_accept_fail;
         mov r15, rax;                            // r15 = accepted fd (listen fd is closed by loop-exit anyway)
 
+        // v1.1-B: session accounting starts NOW (post-accept success).
+        // Server mode has no peer_ip / peer_port at v1.1-A (sys_accept
+        // does not thread an out-address; a future recvfrom / accept
+        // out-param wave lands them). rbp = 0 makes the emitted record
+        // honest -- consumers can distinguish server records by mode==1
+        // + peer_ip==0 without a separate presence flag.
+        xor rbp, rbp;                            // peer_ip = 0 (server mode)
+        xor r12, r12;                            // bytes_in  = 0
+        xor r13, r13;                            // bytes_out = 0 (server v1.1-A never sys_sends)
+        rdtsc;
+        shl rdx, 32;
+        or rax, rdx;
+        mov [rip + pdxsock_session_start_ns], rax;
+
       pdxsock_server_recv_loop:
         // ---- sys_recv(fd, buf, 4096). SC+ ID 93. ----
         mov rdi, r15;
@@ -627,7 +745,10 @@ module Main = structure {
         mov rax, 93;
         syscall;
         cmp rax, 0;
-        jle pdxsock_server_shutdown;
+        jle pdxsock_emit_session_and_exit;
+
+        // v1.1-B: bytes_in += n. Same rationale as the client-side add.
+        add r12, rax;
 
         // ---- sys_write(1, buf, n). SC+ ID 1. ----
         mov rdx, rax;
@@ -638,14 +759,77 @@ module Main = structure {
 
         jmp pdxsock_server_recv_loop;
 
-      pdxsock_server_shutdown:
-        // ---- sys_shutdown(fd, 2). SC+ ID 94. ----
+        // ================================================================
+        // v1.1-B shared tail: emit SockSessionRecord@0.1 via sys_semantic_send
+        //   (SC+ ID 115), then sys_shutdown + sys_exit(0). Reached from the
+        //   client and server recv loops on EOF / -errno.
+        //
+        //   Live callee-save state on entry:
+        //     r12 = bytes_in  (u64)
+        //     r13 = bytes_out (u64)
+        //     r14 = mode      (0=client, 1=server)
+        //     r15 = fd        (for sys_shutdown)
+        //     rbx = port      (u16 in low bits; upper zeros)
+        //     rbp = peer_ip   (u32 in low bits; upper zeros; 0 in server)
+        //     pdxsock_session_start_ns @ .bss holds the rdtsc snapshot
+        //         captured post-connect / post-accept.
+        //
+        //   Scratch (all caller-save; freely trashed):
+        //     rax, rdx      -- rdtsc destinations
+        //     r10           -- record-buffer base
+        //     r11, rcx      -- packed-qword assembly
+        //     rdi, rsi, rdx -- sys_semantic_send / sys_shutdown / sys_exit args
+        //     rcx, r11      -- SYSCALL-clobbered (documented; not read past
+        //                      each syscall).
+        //
+        //   The record is marshalled BEFORE the sys_semantic_send call, so
+        //   the syscall's r11/rcx clobber is invisible to the emit sequence.
+        //   sys_semantic_send's return value (0 / -EFAULT / -EINVAL) is
+        //   intentionally ignored -- the connection is over, and a failure
+        //   at this layer is a marshalling bug in this file, not a per-run
+        //   condition the caller can act on.
+        // ================================================================
+
+      pdxsock_emit_session_and_exit:
+        // ---- session_end_ns via rdtsc reconstruction. ----
+        rdtsc;                                   // EDX:EAX = TSC
+        shl rdx, 32;
+        or rax, rdx;                             // rax = session_end_ns (TSC ticks)
+
+        // ---- Marshal the 40-byte SockSessionRecord@0.1. ----
+        lea r10, [rip + pdxsock_record_buf];
+        mov [r10 + 0], r12;                      // bytes_in
+        mov [r10 + 8], r13;                      // bytes_out
+
+        // Pack peer_ip (low 32) | port (bits 32..47) | mode (bits 48..55).
+        mov r11, rbx;                            // r11 = port
+        shl r11, 32;                             // -> bits 32..47 (upper zeros)
+        mov rcx, r14;                            // rcx = mode
+        shl rcx, 48;                             // -> bits 48..55
+        or r11, rcx;
+        or r11, rbp;                             // OR in peer_ip (low 32)
+        mov [r10 + 16], r11;                     // packed qword
+
+        // session_start_ns -> [+24]. Load from .bss into a scratch reg
+        // first; paideia-as does not encode mem-to-mem moves.
+        mov r11, [rip + pdxsock_session_start_ns];
+        mov [r10 + 24], r11;
+        mov [r10 + 32], rax;                     // session_end_ns
+
+        // ---- sys_semantic_send(schema, record_ptr, record_len). SC+ ID 115. ----
+        mov rdi, 0x536F636B53657301;             // schema tag (SockSessionRecord@0.1)
+        lea rsi, [rip + pdxsock_record_buf];
+        mov rdx, 40;                             // record_len (fits in [1, 240])
+        mov rax, 115;
+        syscall;
+
+        // ---- sys_shutdown(fd, 2 = SHUT_RDWR). SC+ ID 94. ----
         mov rdi, r15;
         mov rsi, 2;
         mov rax, 94;
         syscall;
 
-        // ---- sys_exit(0). ----
+        // ---- sys_exit(0). SC+ ID 60. ----
         xor rdi, rdi;
         mov rax, 60;
         syscall;

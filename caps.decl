@@ -34,13 +34,19 @@
 #                         decl so the -u client path can be flipped
 #                         from stub-to-real by src/*.pdx edits alone
 #                         at M3-001, without a caps.decl churn.
-#   KIND_IPC_ENDPOINT  -- optional; semantic-pipe emission is v1.1-B,
-#                         a follow-on to this issue (paideia-os/pdxsock
-#                         #16). Kept optional at v1.1-A so the ELF
-#                         loads under a parent that has no semantic-
-#                         pipe endpoint plumbed yet.
+#   KIND_IPC_ENDPOINT  -- optional; documentation-only at v1.1-B.
+#                         The v1.1-B semantic-pipe emission wire
+#                         (paideia-os/pdxsock #16) uses
+#                         `sys_semantic_send` (SC+ ID 115), which
+#                         takes NO cap slot -- schema is opaque to
+#                         the kernel and the producer is
+#                         capability-ungated at R107-M0-001. The
+#                         entry is retained so a future
+#                         KIND_SEMANTIC_PIPE recv-side cap (arriving
+#                         with the consumer wave) has a stable spot
+#                         to land without a caps.decl churn.
 
 !KIND_USER               0x001   # invoker attribution (audit)
 !KIND_TCP_SOCKET         0x00B   # READ (0x1) + SEND (0x2) + INVOKE (0x8)
  KIND_UDP_SOCKET         0x00B   # optional -- v1.1-A stub; M3-001 real
- KIND_IPC_ENDPOINT       0x001   # optional -- v1.1-B semantic-pipe
+ KIND_IPC_ENDPOINT       0x001   # optional -- documentation-only (see above)

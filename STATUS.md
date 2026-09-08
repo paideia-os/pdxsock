@@ -2,8 +2,10 @@
 
 **Wave:** R100 (user-space networking tools -- paideia-os
 `design/networking/r100-user-tools-plan.md` §7).
-**Current milestone:** v1.1-A (real-body extraction: retire M1-001
-STUB with the real socket-syscall path) -- **draft, unbuilt**.
+**Current milestone:** v1.1-B (semantic-pipe emission wire:
+SockSessionRecord@0.1 via sys_semantic_send SC+ ID 115) -- **landed**.
+Previous: v1.1-A (real-body extraction; real socket-syscall path) --
+landed.
 **Version:** 0.1.0-dev (pre-tag; a signed 1.0.0 release closes at M5).
 
 See `design/networking/r100-user-tools-plan.md` §13.6 in the
@@ -56,10 +58,23 @@ See `design/networking/r100-user-tools-plan.md` §13.6 in the
       sysnos 96/97 landed at R93.M2-004 (#2052) so the kernel side
       is unblocked.
 - [ ] **M3-002** -- libpdx-audit integration.
-- [ ] **M3-003** -- semantic-pipe: `SockSessionRecord@0.1` (bytes-
-      in/out, peer, duration). Emission wire lands as **v1.1-B**
-      (pdxsock#16), consuming this repo's own STATUS as "M3-003
-      partially met by v1.1-B".
+- [~] **M3-003** -- semantic-pipe: `SockSessionRecord@0.1` (bytes-
+      in/out, peer, duration). **Partially met** by **v1.1-B**
+      (pdxsock#16): every completed TCP connection (client and
+      server) now emits a 40-byte `SockSessionRecord@0.1` via
+      `sys_semantic_send` (SC+ ID 115, paideia-os handler landed at
+      R107-M0-001 #2350) at recv-loop exit, carrying `bytes_in`,
+      `bytes_out`, packed `peer_ip|port|mode`, and TSC-tick
+      `session_start_ns` / `session_end_ns` snapshots (raw rdtsc
+      samples; the schema-shape name is `_ns` but the semantics are
+      cycle counts until user-facing `sys_clock_now` lands). Schema
+      tag `0x536F636B53657301` ("SockSes" + ver01), preserved
+      verbatim once paideia-os#2000 (schema registry) lands. What
+      remains for full M3-003: (i) ns-accurate timestamps (blocked
+      on `sys_clock_now`); (ii) libpdx-audit `audit_id` field
+      (blocked on M3-002); (iii) sys_accept out-address (blocked on
+      a future accept ABI extension) so server-mode records carry a
+      real peer_ip instead of the current honest zero.
 
 ### M4 -- smokes
 
@@ -97,3 +112,40 @@ that a full netcat has that pdxsock at this landing DOES NOT:
 Every other honest-scope constraint in R100 plan §11 (fail-closed
 elevate, semantic-pipe schema fallback, libpdx-audit forgiveness-
 posture) applies here verbatim; those are not v1.1-A concerns.
+
+## v1.1-B honest-scope statement
+
+v1.1-B adds `SockSessionRecord@0.1` emission via `sys_semantic_send`
+(SC+ ID 115) at every completed TCP connection. The record shape
+(40 bytes, schema tag `0x536F636B53657301`) is stable and matches
+the wire-record intent of R100 plan §7.3, but three fields carry
+placeholder or degraded semantics at v1.1-B:
+
+1. **`session_start_ns` / `session_end_ns` are raw TSC ticks, not
+   nanoseconds.** There is no user-facing `sys_clock_now` yet; the
+   schema-shape name is preserved so a re-land is field-additive
+   rather than field-renaming. Consumers can compute a per-run
+   monotonic duration = `end - start` in TSC ticks; converting to
+   wall-time ns needs a per-host TSC frequency the kernel does not
+   publish. Same "monotonic-lookalike (rdtsc sample)" precedent as
+   `src/kernel/core/fs/pdxfs_lite/write.pdx` (R25-M2-005 #919).
+2. **Server-mode `peer_ip` and `peer_port` are always zero.**
+   `sys_accept` at v1.1-A does not thread an out-address (there is
+   no `accept4` / `getpeername` shape in the kernel yet). The
+   record encodes this honestly (mode == 1 + peer_ip == 0 is the
+   documented "server-mode, peer address not observed" state
+   rather than a presence flag).
+3. **No `audit_id` field.** M3-002 (libpdx-audit integration) has
+   not landed; the audit trail record is not yet threaded through
+   the semantic-pipe record. Field will be added at M3-002 close.
+
+The `sys_semantic_send` return value (0 / `-EFAULT` / `-EINVAL`)
+is intentionally discarded at the callsite: the connection is
+already over, and any failure at this layer is a marshalling bug
+in `src/main.pdx` (the 40-byte record is well within the [1, 240]
+byte cap and `pdxsock_record_buf` is a static rip-relative address
+that never fails `user_ptr_ok`) rather than a per-run condition
+the caller can act on. The sysno-115 handler's overwrite-oldest
+ring policy means a downstream backup does not surface as
+`PIPE_FULL` at v1 either -- an older record is silently displaced,
+which the R107-M0-001 landing calls out explicitly.

@@ -6,6 +6,34 @@ changelog-style, semver-ordered, newest first.
 ## [Unreleased]
 
 ### Added
+- **v1.1-B (issue #16) -- semantic-pipe emission wire.** Every
+  completed TCP connection (both `pdxsock <host> <port>` client and
+  `pdxsock -l <port>` server paths) now emits a 40-byte
+  `SockSessionRecord@0.1` via `sys_semantic_send` (SC+ ID 115,
+  paideia-os handler landed at R107-M0-001 #2350) at recv-loop exit,
+  right before `sys_shutdown` + `sys_exit(0)`:
+  - `bytes_in`  (u64): sum of successful `sys_recv` returns.
+  - `bytes_out` (u64): sum of successful `sys_send` returns
+    (always 0 in server mode -- the server body writes stdout only).
+  - `peer_ip | port | mode` (packed u64): peer IPv4 in low 32 bits
+    (server = 0 -- `sys_accept` does not thread an out-address at
+    v1.1-A), peer port in bits 32..47, mode (0=client, 1=server) in
+    bits 48..55.
+  - `session_start_ns` (u64): rdtsc snapshot post-`sys_connect` /
+    post-`sys_accept`. **Raw TSC ticks, not nanoseconds** until
+    `sys_clock_now` lands -- schema-shape name preserved for a
+    field-additive future re-land.
+  - `session_end_ns`   (u64): rdtsc snapshot at recv-loop exit.
+  Schema tag: `0x536F636B53657301` (ASCII-mnemonic "SockSes\x01").
+  Storage: `pdxsock_record_buf` (40B, `@align(8)`, .bss) +
+  `pdxsock_session_start_ns` (u64, .bss). Register plan:
+  `r12 = bytes_in`, `r13 = bytes_out`, `rbp = peer_ip` (post-parse
+  phase, replacing argv-time roles of `r12`/`r13`). Failure paths
+  before the recv loop (socket / connect / bind / listen / accept
+  refusals; usage / bad-port / bad-ip) emit **no** record -- there
+  is no session to describe. `sys_semantic_send`'s return code is
+  discarded at the callsite (marshalling-bug surface, not per-run).
+
 - **v1.1-A (issue #15) -- retire M1-001 STUB body.** `src/main.pdx`
   now wires the real SC+ socket-syscall path over sysnos 87..94
   (socket / bind / listen / accept / connect / send / recv /
