@@ -1,44 +1,63 @@
 # pdxsock -- paideia-as build manifest
 #
-# Wave: R100  Milestone: v1.1-C (release closer -- v1.1.0 tag)
-# Doc:  design/networking/r100-user-tools-plan.md §7 (paideia-os repo).
+# Wave: R100  Milestone: M5-001 (dual-signed release source -- v1.2.0 tag)
+# Doc:  design/networking/r100-user-tools-plan.md §7 + §13.6
+#       (paideia-os repo).
 #
 # Consumed by `paideia-as build` (release-time signer path) and by the
 # tools/build.sh iterator (`src/*.pdx` glob) at day-to-day build time.
 # paideia-as v0.36.0 is the toolchain floor (see tools/build.sh); the
-# release-time ML-DSA-65 signer at M5-001 will additionally require
-# paideia-as v0.33-crypto-kdf per paideia-os design/release-manifest.md.
+# release-time dual-sign at M5-001 additionally invokes
+# paideia-pq-sign::sign_release_artifact (Ed25519 + ML-DSA-65 hybrid)
+# per release/RELEASE-1.2.0.md §4 Step 5. No paideia-as revision-level
+# floor is added at v1.2.0 -- the release-time sign pass runs against
+# a filled-in manifest.pdxsig, not against paideia-as build output
+# directly.
 #
-# The v1.1.0 release closes issues pdxsock#1 (M1-001 scaffold + caps.decl),
-# pdxsock#15 (v1.1-A: real TCP client + server bodies), pdxsock#16 (v1.1-B:
-# SockSessionRecord@0.1 semantic-pipe emit wire) and pdxsock#17 (v1.1-C:
-# this release closer). The signed 1.0-shape release originally planned at
-# M5 is superseded by v1.1.0 -- v1.1-A landed real socket bodies and v1.1-B
-# landed the semantic-pipe emission, both of which the original 1.0 plan
-# treated as post-1.0 milestones; the tag jumps to 1.1.0 rather than
-# regressing 1.1-shape code under a 1.0 tag.
+# The v1.2.0 release closes pdxsock#13 (M5-001 dual-signed release
+# source + `.pdxdoc` + CHANGELOG). It is a release-scaffolding-only
+# minor bump over v1.1.0 -- no source file was added, removed, or
+# edited between the two tags. The compiled ELF a v1.2.0 tree
+# produces is bit-identical to the v1.1.0 one; the delta is
+# release/manifest.pdxsig.txt, release/RELEASE-1.2.0.md, doc/
+# pdxsock.pdxdoc, this file's version + release-block bumps, plus
+# the CHANGELOG.md `[1.2.0]` stanza and the STATUS.md status-header
+# flip.
+#
+# The v1.1.0 release closed issues pdxsock#1 (M1-001 scaffold +
+# caps.decl), pdxsock#15 (v1.1-A: real TCP client + server bodies),
+# pdxsock#16 (v1.1-B: SockSessionRecord@0.1 semantic-pipe emit wire)
+# and pdxsock#17 (v1.1-C: v1.1.0 unsigned source-tag closer). The
+# signed 1.0-shape release originally planned at M5 was superseded
+# by v1.1.0 -- v1.1-A landed real socket bodies and v1.1-B landed
+# the semantic-pipe emission, both of which the original 1.0 plan
+# treated as post-1.0 milestones; the tag jumped to 1.1.0 rather
+# than regressing 1.1-shape code under a 1.0 tag. The M5-001
+# dual-signed release-source landing therefore ships at v1.2.0 as
+# planned in the v1.1.0 CHANGELOG stanza.
 
 name        = pdxsock
-version     = 1.1.0
+version     = 1.2.0
 kind        = tool
 entry       = _start                    # src/main.pdx
 output      = build-out/pdxsock.elf
 caps_decl   = caps.decl
 
 # --- Source list (order-insensitive; paideia-as resolves module deps
-# from `module <Basename> = structure { ... }` headers). At v1.1.0 the
+# from `module <Basename> = structure { ... }` headers). At v1.2.0 the
 # entire tool is a single .pdx (`_start` + inlined argv scanner + TCP
-# client and server bodies + SockSessionRecord@0.1 emission wire).
-# M1-002 (#2, argv scanner move to src/argv.pdx) will split this out
-# post-1.1.0 without touching the tag surface.
+# client and server bodies + SockSessionRecord@0.1 emission wire) --
+# identical to v1.1.0, no source added or removed at M5-001. M1-002
+# (#2, argv scanner move to src/argv.pdx) will split this out at a
+# future minor bump without touching the tag surface.
 sources:
   - src/main.pdx                  # v1.1-A + v1.1-B: TCP client/server + semantic-pipe emit
 
 # --- Library dependencies ----------------------------------------------
-# pdxsock at v1.1.0 depends on nothing outside the SC+ syscall floor
+# pdxsock at v1.2.0 depends on nothing outside the SC+ syscall floor
 # (sysnos 87..94 for socket/bind/listen/accept/connect/send/recv/shutdown
 # + 0/1/60 for read/write/exit + 115 for sys_semantic_send). libpdx-net
-# is not consumed at v1.1.0 -- the client and server bodies call the
+# is not consumed at v1.2.0 -- the client and server bodies call the
 # SC+ syscall stubs inline. libpdx-audit is deferred to M3-002 (audit_id
 # threading through SockSessionRecord). libpdx-argv is deferred to
 # M1-002 (argv scanner extraction).
@@ -46,16 +65,18 @@ deps: []
 
 # --- Test targets ------------------------------------------------------
 # QEMU-substrate smokes are deferred to M4 (pdxsock#7..#10). No golden-
-# fingerprint tests at v1.1.0 -- the tool is exercised end-to-end at
+# fingerprint tests at v1.2.0 -- the tool is exercised end-to-end at
 # paideia-os smoke time via the /bin seeding pipeline (paideia-os
 # issues #1976/#1977).
 tests: []
 
 # --- Documentation targets ---------------------------------------------
-# .pdxdoc source for `doc pdxsock` lands at M5-001 alongside the
-# dual-signed release manifest. v1.1.0 ships with README.md +
-# STATUS.md + CHANGELOG.md only.
-docs: []
+# .pdxdoc source for `doc pdxsock` lands at M5-001 (this landing --
+# doc/pdxsock.pdxdoc). Compilation into a binary `.pdxdoc` runs via
+# the `doc compile` subcommand at doc.M2 (not yet landed in
+# paideia-os); consumers render the source form verbatim until then.
+docs:
+  - doc/pdxsock.pdxdoc            # source form, `pdxdoc-source v0.1`
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants src/main.pdx is written against. A build
@@ -70,13 +91,27 @@ compliance:
   - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
 
 # --- Release policy ----------------------------------------------------
-# v1.1.0 is an unsigned source-tag release: the v1.0-shape dual-signed
-# release-manifest ship path (paideia-os design/release-manifest.md +
-# design/mirror-push.md) lands at M5-001 (pdxsock#11) as a v1.2.0-signed
-# follow-on rather than a re-sign of v1.1.0. This keeps the semantic-
-# pipe emit wire + real socket bodies tagged and reachable now, without
-# blocking on the release-time crypto pipeline (paideia-as v0.33-crypto-
-# kdf signer + paideia-root re-sign + pkgs.paideia-os mirror hand-off).
+# v1.2.0 is the M5-001 dual-signed release-source landing (pdxsock#13).
+# The source form of the manifest lives at release/manifest.pdxsig.txt
+# (paideia-manifest-pdxsig@1 schema, hybrid-ed25519+ml-dsa-65 signature
+# scheme) with every hash and every signature slot a documented
+# placeholder that the release tool (paideia-release fill-manifest +
+# paideia-release sign, invoking paideia-pq-sign::sign_release_artifact
+# twice per manifest) fills in at tag time. The dual-sign pass itself
+# is NOT performed at M5-001 -- release-line seed keys are
+# hardware-backed / KMS-custody per paideia-os design/02-development-
+# environment.md §1164 and never repo-resident. Mirror push to
+# pkgs.paideia-os/main/pdxsock/1.2.0/ is pdxsock#14 (M5-002), gated
+# on the mirror endpoint existing (does not, as of this milestone).
+# See release/RELEASE-1.2.0.md §3 for the S1..S5 substrate-readiness
+# chain and §4 for the cut-a-release procedure.
 release:
-  signer_author  = unsigned              # v1.1.0 unsigned; dual-sign at M5-001
-  mirror_target  = (deferred)            # pkgs.paideia-os/main/pdxsock/1.2.0/ at M5-001
+  signer_author  = paideia-release-line  # placeholder-until-sign at repo
+                                          # tree; see release/manifest.
+                                          # pdxsig.txt [signatures] block
+                                          # for the SIGNATURE_PLACEHOLDER_
+                                          # PENDING_LIVE_SIGN sentinel the
+                                          # dual-sign pass replaces.
+  mirror_target  = pkgs.paideia-os/main/pdxsock/1.2.0/   # M5-002 push (pdxsock#14)
+  manifest_src   = release/manifest.pdxsig.txt           # source form of manifest.pdxsig
+  release_notes  = release/RELEASE-1.2.0.md              # operator runbook

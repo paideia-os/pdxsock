@@ -1,0 +1,213 @@
+%%% pdxdoc-source v0.1
+%%% This is the source form of the .pdxdoc file that `doc pdxsock`
+%%% renders. Format hardening lands with doc.M1-002 (paideia-os plan
+%%% §5.3); the M5-001 source lives in the repo under version control
+%%% and the release tool ships the compiled `.pdxdoc` alongside the
+%%% binary into /pkgs/pdxsock-1.2.0/doc/pdxsock.pdxdoc.
+%%%
+%%% Section markers: a bare `==== <title>` line opens a section. Cross-
+%%% references use `[[cref: <target>]]` where <target> is either a
+%%% doc-local section title or a `<tool>#<section>` fully-qualified
+%%% reference the reader resolves against /system/doc/. POSIX-difference
+%%% annotations use a `[[posix: <difference>]]` inline tag.
+
+==== NAME
+pdxsock -- general TCP/UDP client + server (netcat-adjacent) for
+paideia-os user-space networking.
+
+==== SYNOPSIS
+    pdxsock <host> <port>       # TCP client: connect, forward stdin,
+                                # read reply to stdout, exit.
+    pdxsock -l <port>           # TCP server: bind, listen (backlog=8),
+                                # accept ONE connection, forward
+                                # inbound stream to stdout, exit.
+    pdxsock -u <host> <port>    # UDP client -- documented STUB at
+                                # v1.2.0, exits 3. See [[cref: LIMITATIONS]].
+    pdxsock -lu <port>          # UDP server -- refused at v1.2.0.
+                                # See [[cref: LIMITATIONS]].
+
+`<host>` is a dotted-quad IPv4 literal (`a.b.c.d`, each octet 0..255).
+There is no DNS resolver in the current paideia-os user surface --
+callers pass the numeric address directly. `<port>` is a decimal u16
+(0..65535).
+
+==== DESCRIPTION
+`pdxsock` is a standalone ring-3 ELF -- its own `_start`, no shared
+library, no dynamic linker -- that opens one TCP socket (or refuses
+into a documented UDP stub) and drives it through a fixed
+send/receive shape. It is the netcat-adjacent tool of the R100
+user-space networking wave (`design/networking/r100-user-tools-plan.md`
+§7); [[cref: pdxcurl#NAME]], [[cref: pdxping#NAME]], and
+[[cref: pdxdig#NAME]] are its wave siblings.
+
+Two real dispatch paths are wired at v1.2.0:
+
+- **TCP client** (`pdxsock <host> <port>`): `sys_socket` -> `sys_connect`
+  -> one 4 KiB `sys_read` from stdin -> `sys_send` -> loop
+  (`sys_recv` -> `sys_write` to stdout) until EOF -> `sys_shutdown`
+  -> `sys_exit(0)`.
+- **TCP server** (`pdxsock -l <port>`): `sys_socket` -> `sys_bind`
+  -> `sys_listen(backlog=8)` -> `sys_accept` -> loop
+  (`sys_recv` -> `sys_write` to stdout) until EOF -> `sys_shutdown`
+  -> `sys_exit(0)`.
+
+Both paths emit a 40-byte `SockSessionRecord@0.1` via
+`sys_semantic_send` (SC+ ID 115) at recv-loop exit, immediately
+before `sys_shutdown` -- see [[cref: RECORD]].
+
+`pdxsock` does NOT implement the netcat `-e` exec-on-connect flag
+(a well-known foot-gun). Full-duplex forwarding (netcat's real
+contract, `select`/`poll` over stdin+socket) is out of scope at
+v1.2.0 -- see [[cref: LIMITATIONS]].
+
+==== OPTIONS
+
+---- -l
+Listen mode -- bind + listen + accept + receive-to-stdout, single
+connection. Mutually exclusive with the two-positional
+`<host> <port>` form. Combined with `-u` (`-lu <port>`) it is
+refused, not stubbed -- see [[cref: LIMITATIONS]].
+
+---- -u
+UDP mode. At v1.2.0 emits `pdxsock: udp stub` on fd 2 and exits 3
+regardless of any other flag. Kernel-side syscalls (sysnos 96/97,
+sendto/recvfrom) landed at R93.M2-004 (paideia-os#2052); the hold
+is on `libpdx-net`'s wrapper surface stabilising, tracked as
+pdxsock#6 (M3-001).
+
+==== EXIT-CODES
+     0   OK -- the send/receive session completed and `sys_shutdown`
+         + `sys_exit(0)` were reached.
+     1   Argv error -- missing positional, bad dotted-quad octet
+         (not-a-digit / out-of-range), bad port (empty / not-a-digit
+         / >65535).
+     2   Usage refusal -- an argv shape the tool does not accept at
+         v1.2.0 (e.g. `-lu`).
+     3   UDP stub -- `-u` was given; the client body is not wired
+         at v1.2.0.
+     `>= 32`
+         Syscall errno propagated on socket / bind / listen / accept
+         / connect refusal. The raw errno is the exit status; the
+         diagnostic on fd 2 names which syscall failed
+         [[posix: POSIX shell convention shifts errno into 128 +
+         signal / 32 + errno; pdxsock returns the raw errno for
+         debuggability]].
+
+==== RECORD
+Every completed TCP session (client and server) emits one 40-byte
+`SockSessionRecord@0.1` via `sys_semantic_send` (SC+ ID 115) at
+recv-loop exit, immediately before `sys_shutdown`. Failure paths
+before the recv loop (socket / connect / bind / listen / accept
+refusals; usage / bad-port / bad-ip) emit NO record -- there is no
+session to describe.
+
+Schema tag: `0x536F636B53657301` (ASCII mnemonic "SockSes" + version
+`0x01`). Record layout (little-endian throughout):
+
+    offset  size  field
+    ------  ----  ---------------------------------------------
+    +0      u64   bytes_in            (sum of successful sys_recv)
+    +8      u64   bytes_out           (sum of successful sys_send;
+                                       server mode is always 0 --
+                                       server body writes stdout
+                                       only)
+    +16     u64   peer_ip|port|mode   (packed:
+                                        bits [31:0]  = peer IPv4
+                                                       (server = 0)
+                                        bits [47:32] = peer port
+                                        bits [55:48] = mode
+                                                       (0=client,
+                                                        1=server))
+    +24     u64   session_start_ns    (rdtsc snapshot post-connect
+                                       / post-accept)
+    +32     u64   session_end_ns      (rdtsc snapshot at recv-loop
+                                       exit)
+
+Field-shape notes:
+
+- `session_*_ns` fields are **raw TSC ticks**, not nanoseconds. The
+  schema-shape name is preserved so a re-land is field-additive
+  rather than field-renaming once `sys_clock_now` (a user-facing
+  monotonic clock read) lands. Consumers can compute a per-run
+  monotonic duration = `end - start` in TSC ticks; converting to
+  wall-time ns needs a per-host TSC frequency the kernel does not
+  publish. See [[cref: LIMITATIONS]].
+- **Server-mode `peer_ip` is always 0.** `sys_accept` at v1.2.0
+  does not thread an out-address (no `accept4` / `getpeername`
+  shape exists in the kernel). Record encodes this honestly
+  (mode == 1 + peer_ip == 0 is the documented "server-mode, peer
+  address not observed" state rather than a presence flag).
+
+`sys_semantic_send`'s return value (0 / -EFAULT / -EINVAL) is
+intentionally discarded at the callsite: the connection is already
+over, and any failure at this layer is a marshalling bug in
+`src/main.pdx` rather than a per-run condition the caller can act
+on. The sysno-115 handler's overwrite-oldest ring policy means a
+downstream consumer backup does not surface as `PIPE_FULL` at v1
+either -- an older record is silently displaced.
+
+==== LIMITATIONS
+This release's stub coverage and honest-scope constraints, spelled
+out so a caller does not mistake absence for a bug:
+
+  - **UDP client (`-u <host> <port>`)** is a documented STUB. Emits
+    one diagnostic line on fd 2, exits 3, opens no socket. Lands
+    real at pdxsock#6 (M3-001) once `libpdx-net`'s sendto/recvfrom
+    wrappers stabilise.
+  - **UDP server (`-lu <port>`)** is refused, not stubbed. Out of
+    scope per `design/networking/r100-user-tools-plan.md` §7.2 --
+    needs `recvfrom`-with-peer-address-out-params ABI that
+    `libpdx-net` does not thread through yet.
+  - **Full-duplex forwarding** (real netcat contract via
+    `sys_poll`, sysno 102 landed R95.M3-001 #2080) is out of
+    scope at v1.2.0. The client body does one 4 KiB `sys_read`
+    from stdin, one `sys_send`, then loops recv->stdout until
+    EOF; the server body is receive-only. This is honest as an
+    HTTP-request-shape client (send request, read response,
+    close) but is NOT the netcat contract [[posix: netcat's
+    stdin<->socket interleave is not implemented; the pdxsock
+    body is closer to the `curl --data-binary` fire-and-recv
+    shape]].
+  - **No DNS resolver.** `<host>` MUST be a dotted-quad IPv4
+    literal (`a.b.c.d`). There is no `/etc/resolv.conf`, no
+    `getaddrinfo`-equivalent, and no `sys_gethostbyname` in the
+    paideia-os user surface at this release.
+  - **No IPv6.** `sys_connect`'s address wire is IPv4-only in the
+    current kernel; IPv6 tracking is escalated per
+    `design/networking/ipv6-deferral.md`.
+  - **No TLS.** Cleartext TCP only. TLS termination is out of
+    tree at this release; see
+    `design/networking/tls-placement-decision.md` for the
+    layered-tool intent (pdxsock stays plain-TCP; a future
+    pdxtls tool wraps it, rather than pdxsock growing a
+    `--tls` flag).
+  - **`SockSessionRecord@0.1` timestamps are TSC ticks, not
+    ns.** See [[cref: RECORD]] for the field-additive re-land
+    plan; blocked on user-facing `sys_clock_now`.
+  - **Server-mode `peer_ip` is always 0.** See [[cref: RECORD]]
+    for the `sys_accept` out-address extension that unblocks
+    this.
+  - **No `audit_id` field on `SockSessionRecord@0.1`.**
+    `libpdx-audit` integration is pdxsock#8 (M3-002); the
+    additive field-land happens there.
+  - **Listen fd is not explicitly `sys_close`d before exit.**
+    `sys_exit(0)` reaps the whole task and releases every cap
+    slot, so the un-closed listen fd is not a leak (matches
+    every other `_start` in the paideia-os `src/user/` tree).
+  - **No `--dry-run` flag** -- pdxsock#3 (M1-003).
+  - **No long-form argv (`--listen` / `--udp` / `--dry-run`)** --
+    pdxsock#2 (M1-002). Only the minimal grammar in
+    [[cref: SYNOPSIS]] is accepted at v1.2.0.
+
+See [[cref: pdxsock#CHANGELOG]] (this repo's `CHANGELOG.md`) for
+the full, itemised list with the exact source-file and issue
+number each limitation traces to.
+
+==== SEE ALSO
+`[[cref: pdxcurl#NAME]]`, `[[cref: pdxping#NAME]]`,
+`[[cref: pdxdig#NAME]]`, `[[cref: pdxtrust#NAME]]`,
+`[[cref: libpdx-net#NAME]]`, `[[cref: libpdx-url#NAME]]`.
+
+Design source: `design/networking/r100-user-tools-plan.md` §7 + §13.6
+in the [paideia-os](https://github.com/paideia-os/paideia-os)
+monorepo.

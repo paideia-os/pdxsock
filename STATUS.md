@@ -1,17 +1,24 @@
 # pdxsock -- status
 
 **Wave:** R100 (user-space networking tools -- paideia-os
-`design/networking/r100-user-tools-plan.md` §7).
-**Overall status:** **v1.1.0 released** (2026-09-08).
-**Current milestone:** v1.1-C (release closer: `manifest.pdxproj`
-promoted to 1.1.0, CHANGELOG.md `[1.1.0]` section landed, STATUS.md
-overall status flipped, `v1.1.0` tag cut) -- **landed**.
-Previous: v1.1-B (semantic-pipe emission wire: `SockSessionRecord@0.1`
-via `sys_semantic_send` SC+ ID 115) -- landed.
+`design/networking/r100-user-tools-plan.md` §7 + §13.6).
+**Overall status:** **v1.2.0 release-source landed** (2026-09-09).
+**Current milestone:** M5-001 (dual-signed release source:
+`release/manifest.pdxsig.txt` + `release/RELEASE-1.2.0.md` +
+`doc/pdxsock.pdxdoc` + CHANGELOG.md `[1.2.0]` stanza +
+manifest.pdxproj `version = 1.2.0` bump + this status header
+flip) -- **landed** (closes pdxsock#13).
+Previous: v1.1-C (release closer: `manifest.pdxproj` promoted to
+1.1.0, CHANGELOG.md `[1.1.0]` section landed, `v1.1.0` tag cut) --
+landed.
+Before that: v1.1-B (semantic-pipe emission wire:
+`SockSessionRecord@0.1` via `sys_semantic_send` SC+ ID 115) -- landed.
 Before that: v1.1-A (real-body extraction; real socket-syscall path
 over sysnos 87..94) -- landed.
-**Version:** 1.1.0 (tag `v1.1.0`, unsigned source tag; the dual-signed
-release-manifest ship path lands at M5-001 as v1.2.0-signed).
+**Version:** 1.2.0 (tag `v1.2.0` -- release-scaffolding-only minor
+bump over v1.1.0; dual-signed via `paideia-pq-sign::sign_release_
+artifact` at tag time, source-form manifest at
+`release/manifest.pdxsig.txt`).
 
 See `design/networking/r100-user-tools-plan.md` §13.6 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -93,9 +100,31 @@ See `design/networking/r100-user-tools-plan.md` §13.6 in the
 
 ### M5 -- release
 
-- [ ] **M5-001** -- dual-signed `manifest.pdxsig` + `CHANGELOG-1.0` +
-      `.pdxdoc`.
-- [ ] **M5-002** -- mirror push.
+- [x] **M5-001** -- dual-signed `manifest.pdxsig` (source form) +
+      CHANGELOG (`[1.2.0]` stanza) + `.pdxdoc` (source form). Landed
+      at v1.2.0 (release-scaffolding-only minor bump; no source
+      change from v1.1.0). Artifacts:
+      `release/manifest.pdxsig.txt` (`paideia-manifest-pdxsig@1`
+      schema, hybrid-ed25519+ml-dsa-65 signature scheme, every
+      `<BLAKE3-*>` / `<...-KID-*>` / `<...-SIG-*>` slot a documented
+      placeholder the release tool fills in at tag time --
+      release-line seed key material lives outside every repo per
+      `design/02-development-environment.md` §1164);
+      `release/RELEASE-1.2.0.md` (release note + 8-step operator
+      runbook + expected mirror layout + consumer-side verification
+      recipe); `doc/pdxsock.pdxdoc` (source form, `pdxdoc-source
+      v0.1` shape; compiled `.pdxdoc` produced by `doc compile` at
+      doc.M2, not yet landed in paideia-os); `manifest.pdxproj`
+      `version 1.1.0 -> 1.2.0` + `release.signer_author` +
+      `release.mirror_target` bumps; CHANGELOG.md `[1.2.0]` stanza.
+      Closes pdxsock#13.
+- [ ] **M5-002** -- mirror push. Endpoint
+      `https://pkgs.paideia-os/main/pdxsock/1.2.0/` does not exist
+      as of this milestone; `release/RELEASE-1.2.0.md` §5 documents
+      the layout a future operator pushes. Also blocked on the
+      actual dual-sign pass (`release/RELEASE-1.2.0.md` §3 S3 --
+      live release-line seed keys, out-of-repo custody). Tracked
+      pdxsock#14.
 
 ## v1.1-A honest-scope statement
 

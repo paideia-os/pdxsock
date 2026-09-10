@@ -3,9 +3,102 @@
 All notable changes to `pdxsock` are recorded here. Format: keep-a-
 changelog-style, semver-ordered, newest first.
 
+<!--
+Version discipline:
+  v1.0.x -- reserved for the original M5 dual-signed 1.0-shape plan
+             (superseded by v1.1.0 -- see the [1.1.0] stanza below).
+             No v1.0.0 tag was ever cut.
+  v1.1.0 -- unsigned source-tag release (2026-09-08). Real socket
+             bodies + semantic-pipe emit wire.
+  v1.2.0 -- M5-001 dual-signed release-source landing (this stanza).
+             Release scaffolding only; no source change from v1.1.0.
+-->
+
+
 ## [Unreleased]
 
-_No unreleased changes -- v1.1.0 is the current tag._
+_No unreleased changes -- v1.2.0 is the current tag._
+
+## [1.2.0] - 2026-09-09
+
+M5-001 dual-signed release-source landing. Release-scaffolding-only
+minor bump over v1.1.0 -- no source file was added, removed, or
+edited between the two tags. The delta is release documentation +
+release-manifest source form + `.pdxdoc` source form + the CHANGELOG
++ manifest.pdxproj + STATUS.md metadata bumps every earlier
+satellite tool cut at its own first dual-signed release. Closes
+pdxsock#13 (M5-001). Blocks pdxsock#14 (M5-002 mirror push) only on
+`pkgs.paideia-os` endpoint availability (see
+`release/RELEASE-1.2.0.md` §3 S5).
+
+### Added
+- **`release/manifest.pdxsig.txt`** -- dual-sign release manifest
+  source form, mkfs.pdxfs / umount.pdxfs template shape. Format
+  `paideia-manifest-pdxsig@1`, hash discipline BLAKE3-256 (upper
+  32 bytes, hex-rendered), signature scheme
+  `hybrid-ed25519+ml-dsa-65 (paideia-pq-hybrid-v1)`. Every
+  `<BLAKE3-*>` / `<...-KID-*>` / `<...-SIG-*>` slot is a documented
+  placeholder the release tool
+  (`paideia-release fill-manifest` + `paideia-release sign`)
+  recomputes / fills in at tag time; no hash and no signature is
+  materialised at this milestone (release-line seed key material
+  lives outside every repo per `design/02-development-environment.md`
+  §1164 -- hardware-backed TPM 2.0 / cloud KMS custody). Every
+  `[artifacts.source]` row enumerates exactly the two files pdxsock
+  v1.2.0 ships (`caps.decl` + `src/main.pdx`); `[depends-on]` is
+  empty (no cross-repo library link at v1.2.0);
+  `[not-linked]` records `libpdx-net` / `libpdx-audit` /
+  `libpdx-semantic-pipe` as adjacent-in-plan-only rather than
+  hard-dep for the record.
+- **`release/RELEASE-1.2.0.md`** -- release note + operator runbook
+  for cutting the signed release and pushing it to the
+  `https://pkgs.paideia-os/main/pdxsock/1.2.0/` mirror. Sections:
+  1 (what v1.2.0 ships), 2 (what v1.2.0 does NOT ship -- itemised
+  deferral list with per-issue trace), 3 (substrate readiness S1..S5
+  blocking the actual signed release), 4 (cut-a-release procedure --
+  pre-flight, tag, build, fill-manifest, dual-sign, mirror push,
+  index update, GitHub release), 5 (distribution -- expected mirror
+  layout with the `/pkgs/pdxsock-1.2.0/{bin,doc,caps.decl,manifest.
+  pdxsig}` + `/bin/pdxsock` symlink shape), 6 (verification --
+  consumer-side `pkg install --verify-only`), 7 (what lands at
+  M5-001 vs. what does not).
+- **`doc/pdxsock.pdxdoc`** -- source-form user-facing documentation,
+  `pdxdoc-source v0.1` shape. Sections: NAME, SYNOPSIS, DESCRIPTION,
+  OPTIONS (`-l` + `-u`), EXIT-CODES, RECORD (full
+  `SockSessionRecord@0.1` layout table + field-shape notes),
+  LIMITATIONS (12 items covering UDP stubs, no full-duplex, no DNS,
+  no IPv6, no TLS, TSC-tick timestamps, zero server-mode peer_ip,
+  no audit_id, no `--dry-run`, no long-form argv, un-closed listen
+  fd), SEE ALSO (R100 wave sibling cross-refs). Compiled via `doc
+  compile` at doc.M2 (not yet landed); consumers render the source
+  form verbatim until then.
+
+### Changed
+- **`manifest.pdxproj`** -- `version` bumped `1.1.0 -> 1.2.0`;
+  `release.signer_author` changed `unsigned -> paideia-release-line`
+  (with the placeholder-until-sign discipline documented in-file);
+  `release.mirror_target` changed `(deferred) -> pkgs.paideia-os/
+  main/pdxsock/1.2.0/`. The `docs:` list, previously empty at v1.1.0
+  with the "M5-001 alongside the dual-signed release manifest" hold,
+  now enumerates the new `doc/pdxsock.pdxdoc` source.
+- **`STATUS.md`** -- overall-status header flipped from *v1.1.0
+  released* to *v1.2.0 release-source landed*; M5-001 checklist
+  entry flipped from `[ ]` to `[x]` with per-artifact notes.
+
+### Deferred (documented at v1.2.0)
+- **Mirror push to `pkgs.paideia-os/main/pdxsock/1.2.0/`** --
+  pdxsock#14 (M5-002). Endpoint does not exist as of this
+  milestone; `release/RELEASE-1.2.0.md` §5 documents the layout
+  a future operator pushes.
+- **Actual dual-sign pass** -- release-line seed keys are
+  hardware-backed / KMS-custody per
+  `design/02-development-environment.md` §1164 and never
+  repo-resident. `release/manifest.pdxsig.txt`'s `[signatures]`
+  block carries `SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN` in
+  every slot the real dual-sign pass would fill.
+- **Compiled `.pdxdoc`** -- `doc compile` (doc.M2) is not landed
+  in paideia-os yet. Source form at `doc/pdxsock.pdxdoc` is
+  renderable verbatim until then.
 
 ## [1.1.0] - 2026-09-08
 
