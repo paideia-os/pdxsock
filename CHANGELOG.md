@@ -17,7 +17,92 @@ Version discipline:
 
 ## [Unreleased]
 
-_No unreleased changes -- v1.2.0 is the current tag._
+### Added
+- **`--dry-run` first-runnable (pdxsock#3, M1-003).** When passed
+  as the leading `argv[1]`, `--dry-run` classifies the mode +
+  target that the tool WOULD use and prints a single-line preview
+  on fd 1, then `sys_exit(0)` -- no socket is opened, no
+  `SockSessionRecord@0.1` is emitted, and the 4 KiB `pdxsock_buf`
+  scratch page is left at its .bss zero state (the "we did not
+  run" claim is observable at the memory level).
+
+  Wire format of the preview line:
+  ```
+  pdxsock dry-run mode=<M> target=<H>:<P>\n
+  ```
+  where `<M>` is one of `tcp-client`, `tcp-server`, `udp-client`,
+  `udp-server` (each exactly 10 bytes), `<H>` is either the argv
+  host string (client modes) or the literal `0.0.0.0` (server
+  modes -- honest INADDR_ANY placeholder for the port pdxsock
+  would bind), and `<P>` is the raw argv port string (dry-run
+  intentionally does not re-parse the port -- re-parsing adds a
+  failure surface the real run would already exhibit; the point
+  is a shape preview, not a validation pass).
+
+  Argv grammar accepted at M1-003 (leading-position `--dry-run`
+  only; a positional-flexibility landing that accepts the flag
+  mixed in with `-l`/`-u` at any argv index is deferred, and may
+  be subsumed by the M1-002 argv scanner move -- pdxsock#2):
+  ```
+  pdxsock --dry-run <host> <port>       -> tcp-client
+  pdxsock --dry-run -l <port>           -> tcp-server
+  pdxsock --dry-run -u <host> <port>    -> udp-client
+  pdxsock --dry-run -l -u <port>        -> udp-server
+  ```
+  Any other shape (missing args, unknown flag combinations, a
+  bare positional third argv) falls through to the existing
+  `pdxsock_usage` path (exit 2), matching the real-run classifier
+  refusal shape byte-for-byte.
+
+  Implementation is inline label code under `_start`
+  (`pdxsock_dry_run_entry`, `pdxsock_dry_argc3`, `pdxsock_dry_
+  argc4`, `pdxsock_dry_argc4_u`, `pdxsock_dry_argc4_l`,
+  `pdxsock_dry_tcp_client`, `pdxsock_dry_print`, `pdxsock_dry_
+  write_mode`, `pdxsock_dry_host_strlen`, `pdxsock_dry_host_
+  write`, `pdxsock_dry_host_any`, `pdxsock_dry_after_host`,
+  `pdxsock_dry_port_strlen`, `pdxsock_dry_port_write`) mirroring
+  the existing socket-side classifier tree; no new `pub let`
+  function is introduced (the file remains single-function
+  under `Main`). Preview line composition uses a 7-sys_write
+  chain (prefix / mode / target-kw / host-or-any / colon / port
+  / newline) rather than a compose-into-scratch pass -- avoids
+  a `pdxsock_buf` touch and needs no new .bss.
+
+  Mode encoding on `r14` for the dry-run flow: `0=tcp-client`,
+  `1=tcp-server`, `2=udp-client`, `3=udp-server`. Distinct from
+  the socket-side `r14` usage (which only ever holds 0 or 1) --
+  the two encodings never coexist in one invocation because the
+  dry-run flow never falls through into a socket body.
+
+  Added `.rodata` message constants: `pdxsock_msg_dry_prefix`
+  ("pdxsock dry-run mode="), `pdxsock_msg_mode_tcp_client`,
+  `pdxsock_msg_mode_tcp_server`, `pdxsock_msg_mode_udp_client`,
+  `pdxsock_msg_mode_udp_server`, `pdxsock_msg_target_kw`
+  (" target="), `pdxsock_msg_addr_any` ("0.0.0.0"),
+  `pdxsock_msg_colon`, `pdxsock_msg_newline` plus matching `_len`
+  siblings. No new .bss.
+
+  Closes pdxsock#3.
+
+### Deferred (documented at M1-003)
+- **`--dry-run` in non-leading argv position** (e.g.
+  `pdxsock -l --dry-run <port>`). M1-003 accepts the flag only
+  at `argv[1]`. Positional-flexibility is either a follow-on
+  M1 issue or subsumed by the M1-002 argv scanner move
+  (pdxsock#2), whichever lands first.
+- **Dry-run round-trip smoke** (fixture that pipes `pdxsock
+  --dry-run <shape>` through `bash tools/run-smoke.sh` and diffs
+  the preview line against a golden). Held for M4 alongside the
+  existing TCP echo / UDP echo / large-transfer smokes
+  (pdxsock#7..#10); the file exit path was audited by hand at
+  this landing and every branch classifies to a fixed preview
+  string with no floating state. No `tests/` subdirectory is
+  seeded at this landing -- the `manifest.pdxproj` `tests: []`
+  invariant is preserved until M4 lands the full smoke shape.
+
+### Changed
+- **`STATUS.md`** -- M1-003 checklist entry flipped from `[ ]`
+  to `[x]` with a per-argv-grammar note.
 
 ## [1.2.0] - 2026-09-09
 

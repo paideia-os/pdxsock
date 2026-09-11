@@ -97,9 +97,14 @@
 //     tools-plan.md §7.2 (needs recvfrom peer-address out-params which
 //     the caller-side ABI at this round does not thread through libpdx-
 //     net yet; UDP server would need a different tool shape).
-//   - --dry-run: pdxsock#3 (M1-003). Not accepted here (any arg that
-//     starts with '-' other than exactly '-l' or '-u' falls into the
-//     usage-refusal path).
+//   - --dry-run: LANDED as an [Unreleased] change on top of v1.2.0
+//     (pdxsock#3, M1-003). Leading-position `--dry-run` at argv[1]
+//     is peeled at _start Step 0.5 and the flow enters the dedicated
+//     dry-run classifier (pdxsock_dry_run_entry) which prints
+//     `pdxsock dry-run mode=<M> target=<H>:<P>\n` on fd 1 and
+//     sys_exit(0) without opening any socket. Positional-flexibility
+//     (--dry-run at any argv index) deferred -- may be subsumed by
+//     the M1-002 argv scanner move (pdxsock#2).
 //   - Bidirectional stdin/socket forwarding (netcat's real contract):
 //     v1.1-A's send-then-recv shape is HONEST about being HTTP-style
 //     (send request, read response, close). Full-duplex needs sysno
@@ -210,6 +215,52 @@ module Main = structure {
   pub let pdxsock_msg_accept_fail_len : u64 = 21
 
   // -----------------------------------------------------------------
+  // v1.2-x --dry-run preview strings (issue #3, M1-003).
+  //
+  // Wire format of the preview line (one sys_write chain, no scratch
+  // buffer): `pdxsock dry-run mode=<M> target=<H>:<P>\n` where <M> is
+  // one of the fixed 10-byte mode names below, <H> is either the argv
+  // host string (client modes) or the literal `0.0.0.0` (server modes
+  // -- honest placeholder for the "we would bind INADDR_ANY" fact),
+  // and <P> is the raw argv port string (not parsed at dry-run time --
+  // the point is to preview what the tool WOULD do, and re-parsing
+  // adds a failure surface that the real run would already exhibit).
+  //
+  // Chained-sys_write vs. compose-then-write: the preview line's
+  // variable-length parts (host, port) are pointers into argv, so a
+  // compose-into-scratch pass would need two strlen loops PLUS a copy
+  // pass; a 7-sys_write chain (prefix, mode, target-kw, host-or-any,
+  // colon, port, newline) is smaller code AND avoids the pdxsock_buf
+  // touch (the 4 KiB scratch page is exclusively socket-side data
+  // under v1.1-A / v1.1-B; a --dry-run that leaves it untouched keeps
+  // that invariant honest).
+  //
+  // Each mode name is exactly 10 bytes on the wire so the mode-write
+  // block picks the pointer via a chain of `cmp r14, K; je ...` and
+  // uses a single shared `mov rdx, 10; mov rax, 1; syscall` tail.
+  // -----------------------------------------------------------------
+  pub let pdxsock_msg_dry_prefix       : [u8; 22] = "pdxsock dry-run mode=\0"
+  pub let pdxsock_msg_dry_prefix_len   : u64      = 21
+
+  pub let pdxsock_msg_mode_tcp_client  : [u8; 11] = "tcp-client\0"
+  pub let pdxsock_msg_mode_tcp_server  : [u8; 11] = "tcp-server\0"
+  pub let pdxsock_msg_mode_udp_client  : [u8; 11] = "udp-client\0"
+  pub let pdxsock_msg_mode_udp_server  : [u8; 11] = "udp-server\0"
+  pub let pdxsock_msg_mode_name_len    : u64      = 10
+
+  pub let pdxsock_msg_target_kw        : [u8; 9]  = " target=\0"
+  pub let pdxsock_msg_target_kw_len    : u64      = 8
+
+  pub let pdxsock_msg_addr_any         : [u8; 8]  = "0.0.0.0\0"
+  pub let pdxsock_msg_addr_any_len     : u64      = 7
+
+  pub let pdxsock_msg_colon            : [u8; 2]  = ":\0"
+  pub let pdxsock_msg_colon_len        : u64      = 1
+
+  pub let pdxsock_msg_newline          : [u8; 2]  = "\n\0"
+  pub let pdxsock_msg_newline_len      : u64      = 1
+
+  // -----------------------------------------------------------------
   // v1.1-B semantic-pipe record buffer + supporting state (issue #16).
   //
   // pdxsock_record_buf holds the marshalled SockSessionRecord@0.1
@@ -283,6 +334,85 @@ module Main = structure {
         mov r12, rdi;                           // r12 = argc
         mov r13, rsi;                           // r13 = argv
 
+        // ---- Step 0.5: --dry-run flag peel (issue #3, M1-003). ----------
+        //
+        // If argc >= 2 and argv[1] is exactly the byte sequence
+        // "--dry-run\0" (10 bytes including the terminating NUL), peel
+        // the flag by shifting r13 forward one argv slot and decrementing
+        // r12 -- the classifier that follows then sees the invocation
+        // as if the flag were absent, and jumps into pdxsock_dry_run_
+        // entry instead of the normal argc-gate. Detection is leading-
+        // position only at this landing (issue #3 scope); a positional-
+        // flexibility landing that accepts `--dry-run` mixed in with
+        // `-l`/`-u` at any argv index is deferred to a follow-on M1
+        // issue if the argv scanner move (M1-002 / #2) does not
+        // subsume it.
+        //
+        // Byte-by-byte inline compare rather than a strcmp helper: this
+        // file has no other `pub let` function (every path is inline
+        // label code under _start), so introducing a callable helper
+        // just for this 10-byte match would need a new top-level `pub
+        // let` shape and a `call` encoding this codebase does not yet
+        // exercise. The inline compare touches rbx (argv[1] base ptr)
+        // and rax (per-byte scratch) which the argc-gate below re-
+        // initialises anyway.
+        //
+        // Read-past-NUL safety: argv strings are NUL-terminated per
+        // the execve ABI, so a shorter-than-9 argv[1] terminates the
+        // compare early on the NUL mismatch (byte 0..8 vs. their
+        // expected bytes; the NUL byte will not equal any of the
+        // expected characters). A longer argv[1] whose first 9 bytes
+        // happen to be "--dry-run" but has a trailing character (e.g.
+        // "--dry-runX") fails the byte-9 NUL check and falls through.
+        cmp r12, 2;
+        jl pdxsock_no_dry;
+        mov rbx, [r13 + 8];                     // rbx = argv[1]
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        cmp rax, 0x2d;                           // '-'
+        jne pdxsock_no_dry;
+        xor rax, rax;
+        mov_b rax, [rbx + 1];
+        cmp rax, 0x2d;                           // '-'
+        jne pdxsock_no_dry;
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0x64;                           // 'd'
+        jne pdxsock_no_dry;
+        xor rax, rax;
+        mov_b rax, [rbx + 3];
+        cmp rax, 0x72;                           // 'r'
+        jne pdxsock_no_dry;
+        xor rax, rax;
+        mov_b rax, [rbx + 4];
+        cmp rax, 0x79;                           // 'y'
+        jne pdxsock_no_dry;
+        xor rax, rax;
+        mov_b rax, [rbx + 5];
+        cmp rax, 0x2d;                           // '-'
+        jne pdxsock_no_dry;
+        xor rax, rax;
+        mov_b rax, [rbx + 6];
+        cmp rax, 0x72;                           // 'r'
+        jne pdxsock_no_dry;
+        xor rax, rax;
+        mov_b rax, [rbx + 7];
+        cmp rax, 0x75;                           // 'u'
+        jne pdxsock_no_dry;
+        xor rax, rax;
+        mov_b rax, [rbx + 8];
+        cmp rax, 0x6e;                           // 'n'
+        jne pdxsock_no_dry;
+        xor rax, rax;
+        mov_b rax, [rbx + 9];
+        cmp rax, 0;                              // NUL terminator
+        jne pdxsock_no_dry;
+        // Matches. Shift argv+8, decrement argc, and enter dry-run flow.
+        sub r12, 1;
+        add r13, 8;
+        jmp pdxsock_dry_run_entry;
+
+      pdxsock_no_dry:
         // ---- Step 1: argc gate. -----------------------------------------
         cmp r12, 3;
         je pdxsock_check_argc3;
@@ -830,6 +960,276 @@ module Main = structure {
         syscall;
 
         // ---- sys_exit(0). SC+ ID 60. ----
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ================================================================
+        // v1.2-x --dry-run flow (issue #3, M1-003).
+        //
+        // Entered exclusively via `jmp pdxsock_dry_run_entry` from the
+        // Step 0.5 flag peel. On entry:
+        //   r12 = argc  (post-peel; original argc minus 1)
+        //   r13 = argv+8 (post-peel; effective argv[0] = original argv[1]
+        //                 = "--dry-run"; effective argv[1..] = original
+        //                 argv[2..])
+        //
+        // Mode-classification decision tree (mirrors the socket-side
+        // pdxsock_check_argc3 / pdxsock_check_argc4 tree, but never
+        // opens a socket; every terminal path composes the preview line
+        // and sys_exit(0)):
+        //
+        //   r12 == 3:
+        //     effective argv[1] starts with '-' ?
+        //       yes -> must be exactly "-l\0" -> tcp-server, port =
+        //              effective argv[2]
+        //              (any other leading-'-' -> usage / exit 2)
+        //       no  -> tcp-client, host = effective argv[1], port =
+        //              effective argv[2]
+        //   r12 == 4:
+        //     effective argv[1] starts with '-' ?
+        //       no  -> usage / exit 2 (positional client accepts 2 args
+        //              exactly; a bare third argv position is unknown
+        //              at this milestone)
+        //       yes -> byte-1 = 'u' -> "-u\0" -> udp-client, host =
+        //              effective argv[2], port = effective argv[3]
+        //              byte-1 = 'l' -> "-l\0" -> expect effective
+        //              argv[2] == "-u\0" -> udp-server, port =
+        //              effective argv[3]
+        //              (any other -> usage / exit 2)
+        //   any other argc -> usage / exit 2
+        //
+        // Mode encoding on r14: 0 = tcp-client, 1 = tcp-server,
+        // 2 = udp-client, 3 = udp-server. Distinct from the socket-side
+        // r14 usage (which only ever holds 0 or 1) because the dry-run
+        // flow never enters pdxsock_udp_stub / pdxsock_client_body /
+        // pdxsock_server_body -- the two r14 encodings never coexist
+        // in one invocation.
+        //
+        // Host / port pointer registers on entry to pdxsock_dry_print:
+        //   rbp = host_str ptr (only read for client modes -- r14 == 0
+        //         or r14 == 2)
+        //   r15 = port_str ptr (read for every mode)
+        // Both callee-save; survive every sys_write in the chain.
+        //
+        // The 4 KiB pdxsock_buf and the 40-byte pdxsock_record_buf are
+        // intentionally NOT touched at dry-run time -- a --dry-run
+        // invocation leaves every socket-side scratch structure at its
+        // .bss zero state, making the "we did not run" claim observable
+        // at the memory level (matches the R100 plan §13.6 intent that
+        // --dry-run be a pure preview, not a partial run).
+        // ================================================================
+
+      pdxsock_dry_run_entry:
+        cmp r12, 3;
+        je pdxsock_dry_argc3;
+        cmp r12, 4;
+        je pdxsock_dry_argc4;
+        jmp pdxsock_usage;
+
+      pdxsock_dry_argc3:
+        mov rbx, [r13 + 8];                     // effective argv[1]
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        cmp rax, 0x2d;                           // '-'
+        jne pdxsock_dry_tcp_client;
+        // Leading '-': must be exactly "-l\0" (tcp-server). Any other
+        // "-X" or "-l..." with a trailer is a usage refusal at dry-run
+        // just as it is at the real-run classifier.
+        xor rax, rax;
+        mov_b rax, [rbx + 1];
+        cmp rax, 0x6c;                           // 'l'
+        jne pdxsock_usage;
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0;                              // NUL after 'l'
+        jne pdxsock_usage;
+        // "-l <port>" -- tcp-server.
+        mov r14, 1;
+        mov r15, [r13 + 16];                    // port_str = effective argv[2]
+        jmp pdxsock_dry_print;
+
+      pdxsock_dry_tcp_client:
+        // "<host> <port>" -- tcp-client. host = argv[1] (already in rbx),
+        // port = argv[2].
+        mov r14, 0;
+        mov rbp, rbx;
+        mov r15, [r13 + 16];
+        jmp pdxsock_dry_print;
+
+      pdxsock_dry_argc4:
+        mov rbx, [r13 + 8];                     // effective argv[1]
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        cmp rax, 0x2d;                           // '-'
+        jne pdxsock_usage;
+        xor rax, rax;
+        mov_b rax, [rbx + 1];
+        cmp rax, 0x75;                           // 'u'
+        je pdxsock_dry_argc4_u;
+        cmp rax, 0x6c;                           // 'l'
+        je pdxsock_dry_argc4_l;
+        jmp pdxsock_usage;
+
+      pdxsock_dry_argc4_u:
+        // "-u <host> <port>" -- udp-client.
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0;                              // NUL after 'u'
+        jne pdxsock_usage;
+        mov r14, 2;
+        mov rbp, [r13 + 16];                    // host = effective argv[2]
+        mov r15, [r13 + 24];                    // port = effective argv[3]
+        jmp pdxsock_dry_print;
+
+      pdxsock_dry_argc4_l:
+        // "-l -u <port>" -- udp-server refusal (kept as an explicit
+        // dry-run preview so operators can confirm the shape they
+        // typed classifies as they expect, even though the real-run
+        // form of this invocation exits 3 with "udp stub").
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0;                              // NUL after 'l'
+        jne pdxsock_usage;
+        mov rbx, [r13 + 16];                    // effective argv[2]
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        cmp rax, 0x2d;                           // '-'
+        jne pdxsock_usage;
+        xor rax, rax;
+        mov_b rax, [rbx + 1];
+        cmp rax, 0x75;                           // 'u'
+        jne pdxsock_usage;
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0;                              // NUL after 'u'
+        jne pdxsock_usage;
+        mov r14, 3;
+        mov r15, [r13 + 24];                    // port = effective argv[3]
+        jmp pdxsock_dry_print;
+
+        // ================================================================
+        // Dry-run preview writer.
+        //   r14 = mode  (0 = tcp-client, 1 = tcp-server,
+        //                2 = udp-client, 3 = udp-server)
+        //   rbp = host_str (client modes only; ignored for server modes)
+        //   r15 = port_str (every mode)
+        //
+        // Emits exactly one line on fd 1:
+        //   `pdxsock dry-run mode=<M> target=<H>:<P>\n`
+        // via a 7-sys_write chain. Then sys_exit(0) -- no socket touched,
+        // no semantic-pipe record emitted (dry-run leaves the record
+        // ring untouched too; this is a preview, not a session).
+        //
+        // strlen loops for the argv host/port strings are inlined here
+        // (no other `pub let` function in this file to house them; the
+        // extra ~12 lines per loop is cheaper than a new function
+        // shape and its call/ret encoding). Both loops trust the
+        // execve-ABI NUL termination of argv strings.
+        // ================================================================
+
+      pdxsock_dry_print:
+        // ---- write(1, "pdxsock dry-run mode=", 21) ----
+        mov rdi, 1;
+        lea rsi, [rip + pdxsock_msg_dry_prefix];
+        mov rdx, 21;
+        mov rax, 1;
+        syscall;
+
+        // ---- write(1, mode_str, 10) ----
+        // Pick the mode pointer via a chain of cmp/je. mode == 3 falls
+        // through to pdxsock_dry_write_mode with rsi still pointing at
+        // udp-server (the last lea sets it).
+        lea rsi, [rip + pdxsock_msg_mode_tcp_client];
+        cmp r14, 0;
+        je pdxsock_dry_write_mode;
+        lea rsi, [rip + pdxsock_msg_mode_tcp_server];
+        cmp r14, 1;
+        je pdxsock_dry_write_mode;
+        lea rsi, [rip + pdxsock_msg_mode_udp_client];
+        cmp r14, 2;
+        je pdxsock_dry_write_mode;
+        lea rsi, [rip + pdxsock_msg_mode_udp_server];
+        // fall through (mode == 3)
+
+      pdxsock_dry_write_mode:
+        mov rdi, 1;
+        mov rdx, 10;                             // pdxsock_msg_mode_name_len
+        mov rax, 1;
+        syscall;
+
+        // ---- write(1, " target=", 8) ----
+        mov rdi, 1;
+        lea rsi, [rip + pdxsock_msg_target_kw];
+        mov rdx, 8;
+        mov rax, 1;
+        syscall;
+
+        // ---- write(1, host_or_any, len) ----
+        // Server modes (r14 == 1 or r14 == 3) emit the literal
+        // "0.0.0.0" -- an honest INADDR_ANY placeholder. Client modes
+        // strlen the argv host string and emit it verbatim.
+        cmp r14, 1;
+        je pdxsock_dry_host_any;
+        cmp r14, 3;
+        je pdxsock_dry_host_any;
+        // Client mode: inline strlen on rbp -> rcx.
+        xor rcx, rcx;
+      pdxsock_dry_host_strlen:
+        xor rax, rax;
+        mov_b rax, [rbp + rcx*1];
+        cmp rax, 0;
+        je pdxsock_dry_host_write;
+        add rcx, 1;
+        jmp pdxsock_dry_host_strlen;
+      pdxsock_dry_host_write:
+        mov rdi, 1;
+        mov rsi, rbp;
+        mov rdx, rcx;
+        mov rax, 1;
+        syscall;
+        jmp pdxsock_dry_after_host;
+      pdxsock_dry_host_any:
+        mov rdi, 1;
+        lea rsi, [rip + pdxsock_msg_addr_any];
+        mov rdx, 7;                              // pdxsock_msg_addr_any_len
+        mov rax, 1;
+        syscall;
+
+      pdxsock_dry_after_host:
+        // ---- write(1, ":", 1) ----
+        mov rdi, 1;
+        lea rsi, [rip + pdxsock_msg_colon];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+
+        // ---- write(1, port_str, strlen(port_str)) ----
+        // Inline strlen on r15 -> rcx.
+        xor rcx, rcx;
+      pdxsock_dry_port_strlen:
+        xor rax, rax;
+        mov_b rax, [r15 + rcx*1];
+        cmp rax, 0;
+        je pdxsock_dry_port_write;
+        add rcx, 1;
+        jmp pdxsock_dry_port_strlen;
+      pdxsock_dry_port_write:
+        mov rdi, 1;
+        mov rsi, r15;
+        mov rdx, rcx;
+        mov rax, 1;
+        syscall;
+
+        // ---- write(1, "\n", 1) ----
+        mov rdi, 1;
+        lea rsi, [rip + pdxsock_msg_newline];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+
+        // ---- sys_exit(0) ----
         xor rdi, rdi;
         mov rax, 60;
         syscall;

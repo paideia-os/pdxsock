@@ -44,8 +44,29 @@ See `design/networking/r100-user-tools-plan.md` §13.6 in the
       `--dry-run`). v1.1-A accepts only the minimal grammar above;
       the argv scanner is inlined in `_start` at this landing and
       moves to `src/argv.pdx` at M1-002.
-- [ ] **M1-003** -- first runnable: `--dry-run` prints the mode +
-      target it would use.
+- [x] **M1-003** -- first runnable: `--dry-run` prints the mode +
+      target it would use. Landed as an [Unreleased] change on
+      top of v1.2.0 (pdxsock#3). When `--dry-run` is passed as the
+      leading `argv[1]`, `_start` peels the flag (shifts `r13` by
+      one argv slot and decrements `r12`) and enters
+      `pdxsock_dry_run_entry`, which mirrors the socket-side
+      classifier tree (`pdxsock_check_argc3` / `pdxsock_check_
+      argc4`) but never opens a socket. Every terminal path
+      composes the preview line
+      `pdxsock dry-run mode=<M> target=<H>:<P>\n` via a
+      7-sys_write chain to fd 1 (prefix / mode / " target=" /
+      host-or-`0.0.0.0` / ":" / port / "\n") and `sys_exit(0)`.
+      `<M>` is one of `tcp-client`, `tcp-server`, `udp-client`,
+      `udp-server` (each exactly 10 bytes on the wire); server
+      modes render `<H>` as the literal `0.0.0.0` (honest
+      INADDR_ANY placeholder). Argv grammar: `--dry-run <host>
+      <port>` -> tcp-client; `--dry-run -l <port>` -> tcp-server;
+      `--dry-run -u <host> <port>` -> udp-client; `--dry-run -l
+      -u <port>` -> udp-server. Any other shape falls into
+      `pdxsock_usage` (exit 2). Positional-flexibility (`--dry-
+      run` at any argv index) deferred -- may be subsumed by the
+      M1-002 argv scanner move (pdxsock#2). Dry-run smoke
+      deferred to M4 alongside the TCP/UDP echo smokes.
 
 ### M2 -- TCP client + server real bodies
 
