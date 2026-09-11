@@ -33,6 +33,52 @@
 //     sys_shutdown(new_fd, 2)                  SC+ ID 94
 //     sys_exit(0)                              SC+ ID 60
 //
+// v1.1-A' "bidirectional TCP client pump" scope (issue #4, M2-001)
+// -----------------------------------------------------------------
+// Replaces v1.1-A's HTTP-style client shape (one stdin gulp, one
+// sys_send, then recv-to-stdout loop) with a real stdin->socket /
+// socket->stdout blocking-alternation pump under pdxsock_pump_loop.
+// Loop body per iteration: sys_read(0, buf, 4096); sys_send(fd,
+// buf, n); sys_recv(fd, buf, 4096); sys_write(1, buf, n). Exit
+// conditions: stdin EOF drops into pdxsock_pump_stdin_drain which
+// reads the socket to peer-EOF and forwards to stdout (honest
+// half-close drain, no SHUT_WR wired at this landing); socket EOF
+// or any -errno on either sys_send / sys_recv drops into
+// pdxsock_client_close which emits the M2-001 close-fingerprint
+// band, then jmps to the v1.1-B shared semantic-pipe emit tail.
+//
+// Two grep-searchable fingerprint lines emitted on fd 2 (stderr,
+// NOT fd 1 -- fd 1 is reserved for socket payload):
+//   pdxsock tcp-client connect ok\n
+//     Emitted immediately after sys_connect returns success and
+//     BEFORE the pump loop enters -- proves the handshake landed
+//     even on runs that block on stdin forever.
+//   pdxsock tcp-client bytes-in=<N> bytes-out=<M>\n
+//     Emitted right after pump-loop exit and BEFORE the v1.1-B
+//     SockSessionRecord@0.1 emit. Wire-visible counterpart of the
+//     semantic-pipe record's bytes_in / bytes_out fields; decimal
+//     digits composed by an inline divide-by-10 loop (verbatim
+//     `xor rdx, rdx; div rcx` shape from src/user/init.pdx and
+//     src/user/ps.pdx, R17-M2-736 D12) against two 20-byte .bss
+//     scratches (pdxsock_dec_scratch_in / pdxsock_dec_scratch_out;
+//     u64::MAX = 20 decimal digits so the stashes never overrun).
+//
+// Design choice: blocking-alternation over sys_poll (SC+ ID 102,
+// R95.M3-001 #2080). sys_poll's TCP RX wake wire is DEFERRED per
+// the R95 retrospective; a blocking poll on a TCP fd would not
+// resume when packets arrive, and non-blocking poll (timeout_ms=0)
+// degenerates to a spin loop with no sched_yield surfaced. Task
+// shape at M2-001 explicitly permits blocking-alternation; the
+// honest scope is "request-response-shaped" TCP (each stdin blob
+// prompts a socket response before the next stdin read), which
+// matches every M4-001 echo-smoke witness planned at this
+// milestone. True full-duplex re-lands once TCP RX wake or a
+// non-blocking sys_read on stdin exists.
+//
+// The server body is UNCHANGED at v1.1-A' -- the M2-001 fingerprint
+// band and pump loop are client-only surfaces. Server continues to
+// jump straight to pdxsock_emit_session_and_exit on recv-loop exit.
+//
 // v1.1-B "semantic-pipe emission wire" scope (issue #16)
 // -------------------------------------------------------
 // Adds SockSessionRecord@0.1 emission at end of every completed
@@ -105,12 +151,12 @@
 //     sys_exit(0) without opening any socket. Positional-flexibility
 //     (--dry-run at any argv index) deferred -- may be subsumed by
 //     the M1-002 argv scanner move (pdxsock#2).
-//   - Bidirectional stdin/socket forwarding (netcat's real contract):
-//     v1.1-A's send-then-recv shape is HONEST about being HTTP-style
-//     (send request, read response, close). Full-duplex needs sysno
-//     102 poll (landed R95.M3-001 #2080) plus a select-loop design
-//     that a small tool this size does not need at v1.1-A. Escalated
-//     to a follow-on v1.1-A' issue rather than crammed into this one.
+//   - Bidirectional stdin/socket forwarding: LANDED at v1.1-A'
+//     (pdxsock#4, M2-001) as blocking-alternation over sys_read(0)
+//     and sys_recv(fd). See the v1.1-A' scope block above for the
+//     "why blocking-alternation instead of sys_poll" note; true
+//     full-duplex (concurrent stdin+socket traffic) re-lands once
+//     TCP RX wake or a non-blocking sys_read on stdin exists.
 //
 // Argv grammar accepted at this landing (matches design §7.1 subset):
 //     pdxsock <host> <port>       -- TCP client
@@ -261,6 +307,43 @@ module Main = structure {
   pub let pdxsock_msg_newline_len      : u64      = 1
 
   // -----------------------------------------------------------------
+  // v1.1-A' full-duplex TCP client fingerprints (issue #4, M2-001).
+  //
+  // Two grep-searchable status lines emitted on fd 2 (stderr) that
+  // frame every TCP client run:
+  //
+  //   pdxsock tcp-client connect ok\n
+  //     Emitted immediately after sys_connect returns success and
+  //     before the pump loop enters -- lets the caller (a shell
+  //     smoke, a test harness) confirm the TCP handshake landed
+  //     without waiting for the pump loop to close.
+  //
+  //   pdxsock tcp-client bytes-in=<N> bytes-out=<M>\n
+  //     Emitted right after the pump loop exits (either side EOF)
+  //     and before the v1.1-B SockSessionRecord@0.1 semantic-pipe
+  //     emit -- the wire-visible counterpart of the semantic-pipe
+  //     record's bytes_in / bytes_out fields. Decimal digits are
+  //     composed by an inline divide-by-10 loop against two 20-byte
+  //     .bss scratches (pdxsock_dec_scratch_in/out); u64::MAX is
+  //     20 decimal digits so the scratch never overruns.
+  //
+  // Fingerprints go to fd 2 (stderr), NOT fd 1: pdxsock's stdout is
+  // reserved for the socket payload the peer sent, and a status line
+  // interleaved into that stream would corrupt every downstream
+  // consumer that pipes pdxsock into something (e.g. `pdxsock host
+  // port | grep pattern`). This mirrors the diagnostic-vs-payload
+  // split every existing pdxsock_msg_*_fail line already uses.
+  // -----------------------------------------------------------------
+  pub let pdxsock_msg_connect_ok       : [u8; 31] = "pdxsock tcp-client connect ok\n\0"
+  pub let pdxsock_msg_connect_ok_len   : u64      = 30
+
+  pub let pdxsock_msg_close_prefix     : [u8; 29] = "pdxsock tcp-client bytes-in=\0"
+  pub let pdxsock_msg_close_prefix_len : u64      = 28
+
+  pub let pdxsock_msg_close_mid        : [u8; 12] = " bytes-out=\0"
+  pub let pdxsock_msg_close_mid_len    : u64      = 11
+
+  // -----------------------------------------------------------------
   // v1.1-B semantic-pipe record buffer + supporting state (issue #16).
   //
   // pdxsock_record_buf holds the marshalled SockSessionRecord@0.1
@@ -282,6 +365,31 @@ module Main = structure {
   pub let mut pdxsock_record_buf         : [u8; 40] = uninit @align(8)
   pub let mut pdxsock_session_start_ns   : u64      = 0
   pub let pdxsock_schema_sock_session    : u64      = 0x536F636B53657301
+
+  // -----------------------------------------------------------------
+  // v1.1-A' close-fingerprint decimal scratches (issue #4, M2-001).
+  //
+  // Two 20-byte .bss regions -- one per numeric field on the close
+  // fingerprint line -- into which the divide-by-10 loop stashes the
+  // ASCII digits of bytes_in and bytes_out right-to-left. 20 bytes
+  // covers u64::MAX = 18446744073709551615 (20 digits), so the
+  // stash never overruns even at the theoretical bandwidth ceiling.
+  //
+  // Two separate scratches (rather than one reused) so the emit
+  // sequence is prefix-then-write-then-prefix-then-write with no
+  // reset between them; a shared scratch would need a re-init step
+  // between the two encodings, which is cheap but adds a failure
+  // surface (an off-by-one in the reset would silently emit the
+  // trailing digits of bytes_in as part of bytes_out). Cost is 40
+  // bytes of .bss -- negligible for a static tool this size.
+  //
+  // The scratch layout is caller-only: no other code reads or
+  // writes these bytes, and the divide-by-10 loop overwrites every
+  // used byte on entry (the fingerprint is composed once per run,
+  // right before sys_exit, so re-entry does not exist).
+  // -----------------------------------------------------------------
+  pub let mut pdxsock_dec_scratch_in     : [u8; 20] = uninit @align(8)
+  pub let mut pdxsock_dec_scratch_out    : [u8; 20] = uninit @align(8)
 
   // -----------------------------------------------------------------
   // _start -- pdxsock entry point. Never returns; every terminal path
@@ -747,6 +855,19 @@ module Main = structure {
         cmp rax, 0;
         jl pdxsock_connect_fail;
 
+        // v1.1-A' (issue #4, M2-001): emit "pdxsock tcp-client connect
+        // ok\n" fingerprint on fd 2 immediately after handshake success,
+        // BEFORE the pump loop enters. Lets a smoke or shell caller
+        // observe "the socket is open and connected" without having to
+        // wait for the pump loop's first EOF -- a run that connects and
+        // then blocks on stdin forever (e.g. interactive netcat-shaped
+        // use) still surfaces the connect-ok proof of life.
+        mov rdi, 2;                              // fd = stderr
+        lea rsi, [rip + pdxsock_msg_connect_ok];
+        mov rdx, 30;                             // pdxsock_msg_connect_ok_len
+        mov rax, 1;                              // sys_write
+        syscall;
+
         // v1.1-B: session accounting starts NOW (post-connect success).
         // r12 = bytes_in, r13 = bytes_out (both u64 accumulators over the
         // life of the connection). rdtsc snapshot into
@@ -759,59 +880,261 @@ module Main = structure {
         or rax, rdx;
         mov [rip + pdxsock_session_start_ns], rax;
 
-        // ---- sys_read(0, buf, 4096). SC+ ID 0. One stdin gulp. ----
+        // v1.1-A' (issue #4, M2-001) bidirectional pump.
         //
-        // A tool this size does not need a stdin-drain loop -- one 4 KiB
-        // sys_read covers the typical HTTP-shaped request the test
-        // harness pipes in ("GET / HTTP/1.0\r\n\r\n" is 18 bytes; even
-        // the largest realistic client-side prompt fits in one page).
-        // A zero return (empty stdin -- e.g. `pdxsock host port </dev/
-        // null`) skips the send and falls straight into the recv loop.
+        // Replaces v1.1-A's HTTP-style shape (one stdin gulp, one
+        // sys_send, recv-to-stdout loop) with a real
+        // stdin->socket / socket->stdout blocking-alternation loop.
+        //
+        // Design choice: blocking-alternation over poll-based select.
+        // sys_poll (sysno 102, R95.M3-001 #2080) exists BUT its TCP RX
+        // wake wire is DEFERRED per the R95 retrospective -- a blocking
+        // poll on a TCP fd would not resume when packets arrive.
+        // Non-blocking poll (timeout_ms=0) would work but degenerates
+        // to a spin loop since there is no sys_sched_yield surfaced at
+        // this landing. The task shape explicitly permits blocking-
+        // alternation, so that is what we do; the honest scope is
+        // "request-response-shaped" TCP (each stdin blob prompts a
+        // socket response before we look at stdin again), which
+        // matches every M4-001 echo-smoke witness planned at this
+        // milestone. Full-duplex forwarding for truly concurrent
+        // stdin+socket traffic re-lands once TCP RX wake or a
+        // non-blocking sys_read on stdin exists.
+        //
+        // Loop body:
+        //   1. sys_read(fd=0, buf, 4096)
+        //        rax > 0 -> sys_send that many bytes to the socket
+        //        rax == 0 -> stdin EOF, break to drain-only tail
+        //        rax < 0 -> stdin error, exit clean via emit block
+        //   2. sys_recv(fd=sock, buf, 4096)
+        //        rax > 0 -> sys_write to stdout
+        //        rax <= 0 -> socket EOF or error, exit via emit block
+        //   3. jmp back to step 1.
+        //
+        // Byte accounting is placed BEFORE each corresponding sys_write /
+        // sys_send return-use so a subsequent write error does not skip
+        // the count (the record and the close-fingerprint are about the
+        // socket-side traffic, not the stdout path). bytes_out is only
+        // incremented on send success (rax >= 0).
+        //
+        // Register discipline: r12 (bytes_in), r13 (bytes_out), r14 (mode),
+        // r15 (fd), rbx (port), rbp (peer_ip) are all callee-save; every
+        // syscall preserves them. rax/rcx/rdx/rsi/rdi/r8/r9/r10/r11 are
+        // freely scratched.
+
+      pdxsock_pump_loop:
+        // ---- Step 1: sys_read(0, buf, 4096). SC+ ID 0. ----
         xor rdi, rdi;                            // fd = 0 (stdin)
         lea rsi, [rip + pdxsock_buf];
         mov rdx, 4096;
         mov rax, 0;
         syscall;
         cmp rax, 0;
-        jle pdxsock_client_recv_loop;            // empty / -errno -> no send
+        je pdxsock_pump_stdin_drain;             // stdin EOF -> switch to recv-only
+        jl pdxsock_client_close;                 // stdin error -> clean close
 
         // ---- sys_send(fd, buf, n). SC+ ID 92. ----
-        mov rdx, rax;                            // len = n (must set before rax clobber)
+        mov rdx, rax;                            // len = n
         mov rdi, r15;                            // fd
         lea rsi, [rip + pdxsock_buf];
         mov rax, 92;
         syscall;
-        // v1.1-B: track bytes_out on success (rax >= 0). On -errno we
-        // still enter the recv loop (v1.1-A shape: a broken half-connection
-        // surfaces as recv-side EOF); we simply do not inflate the
-        // bytes_out accumulator with a negative errno-as-u64 value.
         cmp rax, 0;
-        jl pdxsock_client_recv_loop;             // -errno -> skip add, still recv
+        jl pdxsock_client_close;                 // send failed -> close
         add r13, rax;                            // bytes_out += n
 
-      pdxsock_client_recv_loop:
-        // ---- sys_recv(fd, buf, 4096). SC+ ID 93. ----
+        // ---- Step 2: sys_recv(fd, buf, 4096). SC+ ID 93. ----
         mov rdi, r15;
         lea rsi, [rip + pdxsock_buf];
         mov rdx, 4096;
         mov rax, 93;
         syscall;
         cmp rax, 0;
-        jle pdxsock_emit_session_and_exit;       // EOF or -errno -> emit + close
-
-        // v1.1-B: bytes_in += n. Placed BEFORE the sys_write so a
-        // subsequent stdout write error does not skip the accounting
-        // (the record is about the socket-side traffic, not stdout).
-        add r12, rax;
+        jle pdxsock_client_close;                // socket EOF or error -> close
+        add r12, rax;                            // bytes_in += n
 
         // ---- sys_write(1, buf, n). SC+ ID 1. ----
-        mov rdx, rax;                            // count = n
+        mov rdx, rax;
         mov rdi, 1;                              // fd = stdout
         lea rsi, [rip + pdxsock_buf];
         mov rax, 1;
         syscall;
 
-        jmp pdxsock_client_recv_loop;
+        jmp pdxsock_pump_loop;
+
+        // ---- Stdin-EOF tail: drain the socket until IT eofs. ----
+        //
+        // Reached when the local process's stdin closes (e.g. a shell
+        // pipeline's producer finished writing). The peer may still
+        // have unsent bytes queued; we continue reading them and
+        // forwarding to stdout until the peer's side closes too. We do
+        // NOT sys_shutdown the write half here at v1.1-A' -- a future
+        // landing wires SHUT_WR (SC+ ID 94 with how=1) so the peer sees
+        // a clean half-close, but every kernel-side smoke at this
+        // milestone runs the read-drain to peer-EOF and does not
+        // require the half-close signal.
+      pdxsock_pump_stdin_drain:
+        mov rdi, r15;
+        lea rsi, [rip + pdxsock_buf];
+        mov rdx, 4096;
+        mov rax, 93;                             // sys_recv
+        syscall;
+        cmp rax, 0;
+        jle pdxsock_client_close;                // socket EOF -> emit + exit
+        add r12, rax;                            // bytes_in += n
+        mov rdx, rax;
+        mov rdi, 1;
+        lea rsi, [rip + pdxsock_buf];
+        mov rax, 1;
+        syscall;
+        jmp pdxsock_pump_stdin_drain;
+
+        // ================================================================
+        // v1.1-A' TCP-client close tail. Emits the bytes-in/bytes-out
+        // fingerprint line to fd 2, then falls into the v1.1-B shared
+        // semantic-pipe emit + sys_shutdown + sys_exit tail.
+        //
+        // Only the client path reaches here; the server path jumps
+        // straight to pdxsock_emit_session_and_exit (server sockets do
+        // not emit the "tcp-client" fingerprint line, which is a
+        // client-only surface).
+        //
+        // Register discipline: r12 (bytes_in), r13 (bytes_out) are read
+        // twice each (once into r9 for each divide-by-10 loop). rbx
+        // (port), rbp (peer_ip), r14 (mode), r15 (fd) all survive
+        // through to the shared emit block. rax/rcx/rdx/r9/r10/r11 are
+        // scratched. Every SYSCALL below trashes r11/rcx but neither is
+        // read after its issuing syscall.
+        //
+        // Wire format:
+        //   pdxsock tcp-client bytes-in=<N> bytes-out=<M>\n
+        //
+        // Emission is a chain of six sys_writes (prefix, in-digits,
+        // mid, out-digits, newline; the two digit-emits each write
+        // exactly the [first_digit_ptr, len] slice their divide-by-10
+        // loop leaves in [r11, computed_len]). Composing the whole
+        // line into a scratch buffer would need a copy pass on top of
+        // the two divide-by-10 loops; the chain is smaller code and
+        // needs no extra .bss beyond the two 20-byte digit stashes
+        // already declared at module scope.
+        // ================================================================
+
+      pdxsock_client_close:
+        // ---- write(2, "pdxsock tcp-client bytes-in=", 28) ----
+        mov rdi, 2;                              // fd = stderr
+        lea rsi, [rip + pdxsock_msg_close_prefix];
+        mov rdx, 28;                             // pdxsock_msg_close_prefix_len
+        mov rax, 1;
+        syscall;
+
+        // ---- divide-by-10 loop: bytes_in (r12) -> pdxsock_dec_scratch_in. ----
+        //
+        // Right-to-left fill starting at scratch+19. r9 = remaining value,
+        // r11 = cursor. Zero fast-path emits a single '0' digit and
+        // jumps past the loop. On loop exit, r11 points at the first
+        // (most significant) digit; length = (scratch + 20) - r11.
+        mov r9, r12;                             // r9 = bytes_in
+        lea r11, [rip + pdxsock_dec_scratch_in];
+        add r11, 19;                             // cursor at last stash byte
+        cmp r9, 0;
+        jne pdxsock_dec_in_loop;
+          // Zero fast-path.
+          mov al, 0x30;                          // '0'
+          mov [r11], al;
+          mov rdi, 2;
+          mov rsi, r11;
+          mov rdx, 1;
+          mov rax, 1;
+          syscall;
+          jmp pdxsock_dec_in_done;
+
+      pdxsock_dec_in_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;                            // zero-extend for div
+        div rcx;                                 // rax = quot, rdx = rem
+        add rdx, 0x30;                           // digit -> ASCII
+        mov [r11], dl;
+        mov r9, rax;
+        cmp r9, 0;
+        je pdxsock_dec_in_emit;
+        sub r11, 1;                              // advance cursor left
+        jmp pdxsock_dec_in_loop;
+
+      pdxsock_dec_in_emit:
+        // r11 = first-digit pointer. Length = (scratch + 20) - r11.
+        mov rdi, 2;
+        mov rsi, r11;
+        lea rax, [rip + pdxsock_dec_scratch_in];
+        add rax, 20;
+        sub rax, r11;                            // rax = digit count
+        mov rdx, rax;
+        mov rax, 1;
+        syscall;
+
+      pdxsock_dec_in_done:
+        // ---- write(2, " bytes-out=", 11) ----
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_close_mid];
+        mov rdx, 11;                             // pdxsock_msg_close_mid_len
+        mov rax, 1;
+        syscall;
+
+        // ---- divide-by-10 loop: bytes_out (r13) -> pdxsock_dec_scratch_out. ----
+        mov r9, r13;                             // r9 = bytes_out
+        lea r11, [rip + pdxsock_dec_scratch_out];
+        add r11, 19;
+        cmp r9, 0;
+        jne pdxsock_dec_out_loop;
+          mov al, 0x30;
+          mov [r11], al;
+          mov rdi, 2;
+          mov rsi, r11;
+          mov rdx, 1;
+          mov rax, 1;
+          syscall;
+          jmp pdxsock_dec_out_done;
+
+      pdxsock_dec_out_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;
+        div rcx;
+        add rdx, 0x30;
+        mov [r11], dl;
+        mov r9, rax;
+        cmp r9, 0;
+        je pdxsock_dec_out_emit;
+        sub r11, 1;
+        jmp pdxsock_dec_out_loop;
+
+      pdxsock_dec_out_emit:
+        mov rdi, 2;
+        mov rsi, r11;
+        lea rax, [rip + pdxsock_dec_scratch_out];
+        add rax, 20;
+        sub rax, r11;
+        mov rdx, rax;
+        mov rax, 1;
+        syscall;
+
+      pdxsock_dec_out_done:
+        // ---- write(2, "\n", 1) ----
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_newline];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+
+        // Jump to the v1.1-B shared semantic-pipe emit tail. Explicit
+        // jump rather than fall-through: the label immediately below
+        // in source order is pdxsock_server_body (the TCP server
+        // dispatch entry), NOT pdxsock_emit_session_and_exit. A
+        // fall-through here would silently re-enter the server body
+        // with client-side registers, opening a second socket and
+        // reissuing bind/listen against port r14. The explicit jump
+        // preserves label-order flexibility for future refactoring.
+        jmp pdxsock_emit_session_and_exit;
 
         // ================================================================
         // TCP server body.

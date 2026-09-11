@@ -17,7 +17,97 @@ Version discipline:
 
 ## [Unreleased]
 
+### Changed
+- **TCP client: real bidirectional pump + close-fingerprint band
+  (pdxsock#4, M2-001).** Retires v1.1-A's HTTP-style client shape
+  (one 4 KiB `sys_read(0, …)`, one `sys_send`, then a
+  `sys_recv`-to-stdout loop) with a real stdin->socket /
+  socket->stdout blocking-alternation pump.
+
+  Loop shape (one iteration):
+  1. `sys_read(fd=0, buf, 4096)` -- rax > 0 sends that many bytes
+     to the socket; rax == 0 (stdin EOF) drops into a socket-only
+     drain tail; rax < 0 (stdin error) exits clean via the emit
+     block.
+  2. `sys_send(fd=sock, buf, n)` -- rax >= 0 increments `bytes_out`;
+     rax < 0 exits via the emit block.
+  3. `sys_recv(fd=sock, buf, 4096)` -- rax > 0 writes to stdout
+     and increments `bytes_in`; rax <= 0 (socket EOF or error)
+     exits via the emit block.
+  4. Loop.
+
+  When stdin closes first (`pdxsock host port </dev/null`, or a
+  finished pipeline producer), the loop switches to
+  `pdxsock_pump_stdin_drain` which reads the socket to
+  peer-EOF and forwards to stdout without ever touching stdin
+  again -- half-closed connections are honestly drained rather
+  than silently truncated.
+
+  Design choice: blocking-alternation over `sys_poll`
+  (SC+ ID 102, R95.M3-001). `sys_poll`'s TCP RX wake wire is
+  DEFERRED per the R95 retrospective; a blocking poll on a TCP fd
+  would not resume when packets arrive, and non-blocking poll
+  (timeout_ms=0) degenerates to a spin loop with no
+  sched_yield surfaced. The task shape at M2-001 explicitly
+  permits blocking-alternation; the honest scope is
+  "request-response-shaped" TCP (each stdin blob prompts a
+  socket response before the next stdin read), which matches
+  every M4-001 echo-smoke witness planned at this milestone.
+  True full-duplex re-lands once TCP RX wake or a non-blocking
+  `sys_read` on stdin exists.
+
 ### Added
+- **TCP client fingerprint band (pdxsock#4, M2-001).** Two
+  grep-searchable status lines on fd 2 (stderr, NOT stdout --
+  stdout is reserved for socket payload) that frame every TCP
+  client run:
+
+  1. `pdxsock tcp-client connect ok\n` -- emitted immediately
+     after `sys_connect` returns success and BEFORE the pump
+     loop enters. Lets a smoke or shell caller observe the
+     completed TCP handshake without waiting for the pump
+     loop's first EOF (an interactive netcat-shaped run blocked
+     on stdin still surfaces the connect-ok line).
+  2. `pdxsock tcp-client bytes-in=<N> bytes-out=<M>\n` --
+     emitted right after the pump loop exits and BEFORE the
+     v1.1-B `SockSessionRecord@0.1` semantic-pipe emit. Wire-
+     visible counterpart of the semantic-pipe record's
+     `bytes_in` / `bytes_out` fields; decimal digits composed
+     by an inline divide-by-10 loop (verbatim
+     `xor rdx, rdx; div rcx` shape from `src/user/init.pdx`
+     `print_u64_dec` / `src/user/ps.pdx` `print_u64_dec`,
+     R17-M2-736 D12) against two 20-byte `.bss` scratches
+     (`pdxsock_dec_scratch_in` / `pdxsock_dec_scratch_out`;
+     u64::MAX = 20 decimal digits so the stashes never overrun).
+
+  Both fingerprints are client-only; the TCP server body
+  continues to jump straight to
+  `pdxsock_emit_session_and_exit` (the shared semantic-pipe
+  emit + `sys_shutdown` + `sys_exit(0)` tail) without an
+  equivalent `pdxsock tcp-server ...` line -- the server-side
+  close-fingerprint band lands with M2-002 follow-up work if
+  the R100 plan §13.6 calls for it.
+
+  Added `.rodata` message constants: `pdxsock_msg_connect_ok`
+  (30 bytes on the wire), `pdxsock_msg_close_prefix`
+  (28 bytes: `"pdxsock tcp-client bytes-in="`),
+  `pdxsock_msg_close_mid` (11 bytes: `" bytes-out="`).
+  Reuses `pdxsock_msg_newline` for the terminal `\n`.
+
+  Added `.bss` scratches: `pdxsock_dec_scratch_in`,
+  `pdxsock_dec_scratch_out` (both `[u8; 20] @align(8)`).
+
+  New labels under `_start`: `pdxsock_pump_loop`,
+  `pdxsock_pump_stdin_drain`, `pdxsock_client_close`,
+  `pdxsock_dec_in_loop`, `pdxsock_dec_in_emit`,
+  `pdxsock_dec_in_done`, `pdxsock_dec_out_loop`,
+  `pdxsock_dec_out_emit`, `pdxsock_dec_out_done`. The old
+  `pdxsock_client_recv_loop` label is retired (its recv+write
+  shape is subsumed by the pump loop's step 2 + the drain
+  tail).
+
+  Closes #4.
+
 - **`--dry-run` first-runnable (pdxsock#3, M1-003).** When passed
   as the leading `argv[1]`, `--dry-run` classifies the mode +
   target that the tool WOULD use and prints a single-line preview
