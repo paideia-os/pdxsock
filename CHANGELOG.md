@@ -18,6 +18,51 @@ Version discipline:
 ## [Unreleased]
 
 ### Changed
+- **`SockSessionRecord@0.1` re-lay to the R100 §13.6 generic-tool
+  contract (pdxsock#8, M3-003).** Retires the v1.1-B 40-byte layout
+  (`bytes_in | bytes_out | peer|port|mode packed | session_start_ns
+  | session_end_ns`) in favour of a 48-byte layout that leads with
+  a self-identifying `PDXKSOCK` magic (8 ASCII bytes, little-endian
+  `u64 0x4B434F534B584450`) + `version:u32 = 1` + `flags:u32 = 0`
+  header; a consumer that finds a record starting with this magic
+  parses the pdxsock shape without an out-of-band schema-tag
+  lookup. Body fields: `bytes_in:u64`, `bytes_out:u64`, then a
+  packed `peer_ip:u32 | peer_port:u16 | reserved:u16` (mode field
+  DROPPED -- server-mode is still distinguishable by `peer_ip == 0`
+  as in v1.1-B), then a single `duration_ns:u64` computed as
+  `(session_end_ns - session_start_ns)` at emit time. The two v1.1-B
+  raw-TSC snapshot fields collapse into this one duration field --
+  consumers wanting raw timestamps can no longer recover them from
+  the record alone, but duration is the only field any current
+  consumer needs. `duration_ns` remains raw TSC ticks (not
+  nanoseconds) until user-facing `sys_clock_now` lands; the
+  schema-shape name is preserved so the re-land is field-
+  preserving. `sys_semantic_send` (SC+ ID 115) ring-emission path
+  is unchanged in shape -- only the `record_len` bumps from 40 to
+  48 to match the new layout; schema tag (`0x536F636B53657301`)
+  survives the re-lay because the tag names the record family, not
+  the byte layout.
+
+  Closes #8.
+
+- **Opt-in fd-3 semantic-pipe emission (pdxsock#8, M3-003).**
+  Alongside the ring-emission path above, the close tail now
+  `sys_write`s the same 48 bytes to file descriptor 3. `pdxsock`
+  NEVER opens fd 3 itself; a parent (shell, launcher, smoke
+  harness) pre-wires fd 3 to a pipe / socket / regular file
+  before execve (Unix `3>&pipe` shell convention). Absence of
+  fd 3 is the expected default -- `sys_write` returns `-EBADF`
+  and the emit block silently discards (no fd-2 diagnostic; the
+  record was already sent to the ring, and pipe absence is not a
+  session-completion condition the tool can act on). The write
+  is unconditional and un-gated (no `sys_fstat`-first probe --
+  that would add a second syscall to every clean-close for a
+  rarely-wired feature; the kernel-side fd-table `-EBADF` path
+  is O(1)). No argv flag or env parse added -- the v1.1 argv
+  grammar is preserved. `caps.decl` is unchanged: `sys_write` on
+  a pre-wired fd requires no additional cap slot beyond the
+  parent-passed handle.
+
 - **TCP server: bind+listen+accept + shared bidirectional pump
   (pdxsock#5, M2-002).** Retires v1.1-A's recv-only server tail
   (`sys_recv` -> `sys_write` -> break) with the shared

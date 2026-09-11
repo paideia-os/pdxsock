@@ -127,31 +127,78 @@
 // connection (client or server), via sys_semantic_send (SC+ ID 115,
 // paideia-os handler landed at R107-M0-001 #2350).
 //
-// Record shape (40 bytes, @align(8), fits in the sysno-115 240-byte
-// per-slot cap with 200 bytes of headroom for future fields):
+// v1.2-B M3-003 "SockSessionRecord@0.1 (48B) + fd-3 pipe" (pdxsock#8)
+// ------------------------------------------------------------------
+// Re-lays the record from the v1.1-B "40 bytes, packed peer|port|mode"
+// shape onto the R100 §13.6 generic-tool record contract: 48 bytes,
+// with a leading `PDXKSOCK` magic (8 ASCII) + `version:u32` + `flags:
+// u32` self-identifying header, so any consumer that finds a record
+// beginning with this magic knows to parse it under the pdxsock
+// schema without an out-of-band schema-tag lookup. `mode` is DROPPED
+// from the record (server-mode records are still distinguishable by
+// `peer_ip == 0`, per the v1.1-B honest-encoding convention) and the
+// separate start/end TSC snapshots collapse into a single duration_ns
+// field the tool computes at emit time.
 //
-//   [ +0]  bytes_in         u64   -- socket->local octets (sys_recv sum)
-//   [ +8]  bytes_out        u64   -- local->socket octets (sys_send sum);
-//                                    at v1.2-A M2-002 the server body
-//                                    reuses the shared bidirectional
-//                                    pump and can accumulate a nonzero
-//                                    bytes_out (retires the v1.1-B
-//                                    "server always 0" note).
-//   [+16]  peer_ip_port_mode u64  -- packed:
-//                                     bits [ 0..31] = peer_ip u32 (server=0
-//                                                    since sys_accept at
-//                                                    v1.1-A does not thread
-//                                                    an out-address)
-//                                     bits [32..47] = peer_port u16
-//                                     bits [48..55] = mode      u8 (0=client,
-//                                                                   1=server)
-//                                     bits [56..63] = reserved  u8 (0)
-//   [+24]  session_start_ns u64   -- rdtsc snapshot taken right AFTER
-//                                    sys_connect (client) or sys_accept
-//                                    (server) returns success
-//   [+32]  session_end_ns   u64   -- rdtsc snapshot taken at recv-loop exit
-//                                    (either EOF or -errno) just before
-//                                    sys_semantic_send + sys_shutdown
+// The `sys_semantic_send` ring emission at SC+ ID 115 remains (schema
+// tag unchanged: 0x536F636B53657301 -- "SockSes" + version 0x01),
+// with the record length bumped from 40 to 48 to match the new
+// layout. In parallel, an OPT-IN fd-3 sys_write emits the same record
+// bytes to a semantic-pipe file descriptor the parent (shell / launcher
+// / smoke harness) may pre-wire before execve. The tool NEVER opens
+// fd 3 itself; if fd 3 is not open at emit time, sys_write returns
+// -EBADF and the emission block silently swallows it (a downstream
+// pipe absence is not a session-completion condition). This mirrors
+// the Unix convention of stdin/stdout/stderr occupying fds 0/1/2 with
+// fd 3 as the first "extra" fd a parent may pre-wire (`3>&pipe` in a
+// shell); no argv flag or env variable parse is added, keeping the
+// v1.1 argv grammar unchanged.
+//
+// Record shape (48 bytes, @align(8), fits in the sysno-115 240-byte
+// per-slot cap with 192 bytes of headroom for future fields):
+//
+//   [ +0]  magic            [u8; 8] -- "PDXKSOCK" ASCII, little-endian
+//                                      u64 0x4B434F534B584450. Grep-
+//                                      friendly self-identifier for
+//                                      the pdxsock generic-tool
+//                                      record family.
+//   [ +8]  version          u32     -- SSR_VERSION = 1 (v0.1 schema).
+//                                      Consumers refuse an unknown
+//                                      version rather than parse.
+//   [+12]  flags            u32     -- reserved; zero at v1.2-B.
+//                                      Future bits may signal
+//                                      truncation, mode, or peer-
+//                                      address presence without a
+//                                      schema-tag bump.
+//   [+16]  bytes_in         u64     -- socket->local octets
+//                                      (sys_recv sum).
+//   [+24]  bytes_out        u64     -- local->socket octets
+//                                      (sys_send sum). Server mode
+//                                      is potentially nonzero at
+//                                      v1.2-A+ (shared pump does
+//                                      sys_send on stdin bytes).
+//   [+32]  peer_ip          u32     -- IPv4 peer address, network
+//                                      byte order preserved from
+//                                      sys_connect input (0 in
+//                                      server mode -- sys_accept
+//                                      does not thread out-address).
+//   [+36]  peer_port        u16     -- TCP peer port (0 in server
+//                                      mode; the LOCAL bind port is
+//                                      what rbx carries in server
+//                                      mode, and the record's peer_*
+//                                      fields describe the OTHER end).
+//   [+38]  reserved         u16     -- zero at v1.2-B.
+//   [+40]  duration_ns      u64     -- (session_end_ns -
+//                                      session_start_ns) TSC ticks
+//                                      (see caveat below on ns vs
+//                                      ticks). Single field replaces
+//                                      the v1.1-B [+24]/[+32] pair;
+//                                      consumers that want raw
+//                                      timestamps can no longer
+//                                      recover them from the record
+//                                      alone, but the duration is
+//                                      the only field any current
+//                                      consumer needs.
 //
 // Timestamp caveat: at v1.1-B these are raw TSC samples (cycles), NOT
 // nanoseconds. There is no user-facing sys_clock_now yet; the design
@@ -435,27 +482,57 @@ module Main = structure {
   pub let pdxsock_msg_close_prefix_srv_len : u64      = 28
 
   // -----------------------------------------------------------------
-  // v1.1-B semantic-pipe record buffer + supporting state (issue #16).
+  // v1.1-B semantic-pipe record buffer + supporting state (issue #16),
+  // grown to 48 bytes for the v1.2-B M3-003 layout re-lay (pdxsock#8).
   //
   // pdxsock_record_buf holds the marshalled SockSessionRecord@0.1
-  // (40 bytes, layout in the file header). @align(8) so every u64
-  // store is naturally aligned. .bss-resident (uninit); every field is
-  // overwritten at emit time, so the initial contents are irrelevant.
+  // (48 bytes at v1.2-B, layout in the file header). @align(8) so
+  // every u64 store is naturally aligned. .bss-resident (uninit);
+  // every field is overwritten at emit time, so the initial contents
+  // are irrelevant.
   //
   // pdxsock_session_start_ns caches the rdtsc snapshot taken right
   // after sys_connect (client) / sys_accept (server) returns success,
-  // so the emit block can read it back into a register without holding
-  // it in a scarce callee-save across the entire recv loop. .bss with
+  // so the emit block can compute (session_end - session_start) into
+  // the record's duration_ns field without holding the start snapshot
+  // in a scarce callee-save across the entire recv loop. .bss with
   // = 0 initializer (matches src/kernel/core/syscall/handlers/
   // sys_semantic_send.pdx's _semantic_ring_head declaration).
   //
   // pdxsock_schema_sock_session is the schema fingerprint the kernel
   // stores verbatim into the ring slot's schema u64. Grep-searchable
   // constant; see the file header for the ASCII-mnemonic derivation.
+  // Unchanged from v1.1-B (schema tag survives the record-shape
+  // re-lay because the tag names the record family, not the byte
+  // layout; consumers key off the leading `PDXKSOCK` magic + version
+  // for layout selection).
+  //
+  // pdxsock_ssr_magic is the leading 8 ASCII bytes ("PDXKSOCK", little-
+  // endian u64) the emit block writes at record[+0]. Declared as a
+  // documentation constant here; the emit path uses a movabs to load
+  // the same value inline (avoids a second rip-relative fetch in the
+  // marshalling hot path).
+  //
+  // pdxsock_ssr_pipe_fd is the fixed file descriptor number the fd-3
+  // semantic-pipe sys_write targets. Not opened by pdxsock; a parent
+  // (shell, launcher, smoke harness) pre-wires fd 3 to a pipe /
+  // socket / regular file before execve, and pdxsock's emit block
+  // writes the 48-byte record to it. If fd 3 is not open, sys_write
+  // returns -EBADF and the emit block silently ignores.
   // -----------------------------------------------------------------
-  pub let mut pdxsock_record_buf         : [u8; 40] = uninit @align(8)
+  pub let mut pdxsock_record_buf         : [u8; 48] = uninit @align(8)
   pub let mut pdxsock_session_start_ns   : u64      = 0
   pub let pdxsock_schema_sock_session    : u64      = 0x536F636B53657301
+  // ssr_magic and ssr_version_and_flags are u64 (not u32/u8) because
+  // every existing pub-let constant in the user src tree is u64 and
+  // paideia-as's `pub let X : uN = imm` typing is battle-tested only
+  // for the u64 arm at this revision (safety-first per the "silently
+  // exits 0" pdxsock defect memory). ssr_version_and_flags packs
+  // version:u32 in bits [ 0..31] and flags:u32 in bits [32..63] so
+  // one mov [rN + 8], rM store places both fields in one instruction.
+  pub let pdxsock_ssr_magic              : u64      = 0x4B434F534B584450
+  pub let pdxsock_ssr_version_and_flags  : u64      = 0x0000000000000001
+  pub let pdxsock_ssr_pipe_fd            : u64      = 3
 
   // -----------------------------------------------------------------
   // v1.1-A' close-fingerprint decimal scratches (issue #4, M2-001).
@@ -1547,32 +1624,122 @@ module Main = structure {
         shl rdx, 32;
         or rax, rdx;                             // rax = session_end_ns (TSC ticks)
 
-        // ---- Marshal the 40-byte SockSessionRecord@0.1. ----
-        lea r10, [rip + pdxsock_record_buf];
-        mov [r10 + 0], r12;                      // bytes_in
-        mov [r10 + 8], r13;                      // bytes_out
-
-        // Pack peer_ip (low 32) | port (bits 32..47) | mode (bits 48..55).
-        mov r11, rbx;                            // r11 = port
-        shl r11, 32;                             // -> bits 32..47 (upper zeros)
-        mov rcx, r14;                            // rcx = mode
-        shl rcx, 48;                             // -> bits 48..55
-        or r11, rcx;
-        or r11, rbp;                             // OR in peer_ip (low 32)
-        mov [r10 + 16], r11;                     // packed qword
-
-        // session_start_ns -> [+24]. Load from .bss into a scratch reg
-        // first; paideia-as does not encode mem-to-mem moves.
+        // ---- duration_ns = session_end - session_start. ----
+        //
+        // rax carries the end snapshot from the rdtsc above. Subtract
+        // the .bss-cached start snapshot into rax so the marshalling
+        // block below can drop it straight into record[+40]. r11 is
+        // freely scratched here (SYSCALL-clobbered later; not read).
+        // TSC monotonicity across a single CPU is a hardware invariant
+        // on IA32_TSC-capable cores (every 64-bit x86 since Nehalem);
+        // a pathological migration mid-session could in theory yield
+        // a negative delta, which two's-complement wraps to a large
+        // u64 -- the emit path treats this as an honest artefact of
+        // the raw-TSC caveat rather than gate on it (the alternative
+        // is silently dropping the record, which loses information).
         mov r11, [rip + pdxsock_session_start_ns];
-        mov [r10 + 24], r11;
-        mov [r10 + 32], rax;                     // session_end_ns
+        sub rax, r11;                            // rax = duration_ns (TSC ticks)
+
+        // ---- Marshal the 48-byte SockSessionRecord@0.1 (v1.2-B M3-003). ----
+        //
+        // Byte layout (little-endian, @align(8)):
+        //   [ +0]  magic:u64             ("PDXKSOCK" ASCII LE)
+        //   [ +8]  version:u32 | flags:u32 (packed as one u64 store)
+        //   [+16]  bytes_in:u64          (from r12)
+        //   [+24]  bytes_out:u64         (from r13)
+        //   [+32]  peer_ip:u32 | peer_port:u16 | reserved:u16
+        //                                (packed as one u64 store)
+        //   [+40]  duration_ns:u64       (rax, from the sub above)
+        //
+        // r10 = record base pointer. r11 scratched for each field.
+        // Store order chosen to minimise register pressure: the r11-
+        // dependency (start_ns load) has already been consumed into
+        // rax, so r11 is free for magic + packing scratch.
+        lea r10, [rip + pdxsock_record_buf];
+
+        // magic -- movabs 8B constant into r11 then store. Using an
+        // inline movabs (rather than a rip-relative load from
+        // pdxsock_ssr_magic) saves one memory access on the hot path;
+        // the constant declaration remains as documentation.
+        mov r11, 0x4B434F534B584450;             // "PDXKSOCK" LE
+        mov [r10 + 0], r11;
+
+        // version:u32 | flags:u32 -- one u64 store places version in
+        // bits [0..31] and flags in bits [32..63]. Version = 1, flags
+        // = 0 -- pdxsock_ssr_version_and_flags loaded from .rodata.
+        mov r11, [rip + pdxsock_ssr_version_and_flags];
+        mov [r10 + 8], r11;
+
+        // bytes_in / bytes_out -- direct callee-save stores.
+        mov [r10 + 16], r12;                     // bytes_in
+        mov [r10 + 24], r13;                     // bytes_out
+
+        // Pack peer_ip (low 32) | peer_port (bits 32..47) | reserved
+        // (bits 48..63) into one u64 store at [+32]. rbp holds
+        // peer_ip (server = 0; client-mode: the ip parser accumulates
+        // into rdx as a u32-shaped u64 with upper 32 zero). rbx holds
+        // the parsed port -- in CLIENT mode this is the remote peer's
+        // port (the true peer_port); in SERVER mode this is the LOCAL
+        // bind port, which is NOT the peer's port. The record's peer_*
+        // fields describe the OTHER end, so server mode zeroes rbx
+        // before packing so peer_port lands honest (0 = "not observed"
+        // matching the peer_ip = 0 convention). Reserved bits stay
+        // zero (no OR-in step).
+        //
+        // Branch shape: `cmp r14, 1; je pdxsock_emit_zero_port` -- one
+        // conditional over a tiny fall-through, no ret/call encoding.
+        mov r11, rbx;                            // r11 = port (client-mode default)
+        cmp r14, 1;                              // server mode?
+        jne pdxsock_emit_pack_port;
+        xor r11, r11;                            // server: peer_port = 0
+      pdxsock_emit_pack_port:
+        shl r11, 32;                             // -> bits 32..47
+        or r11, rbp;                             // OR in peer_ip (server-mode rbp = 0)
+        mov [r10 + 32], r11;
+
+        // duration_ns from rax (computed above).
+        mov [r10 + 40], rax;
 
         // ---- sys_semantic_send(schema, record_ptr, record_len). SC+ ID 115. ----
+        //
+        // Ring-emission path -- unchanged since v1.1-B except for the
+        // record_len bump from 40 to 48 to match the new layout.
+        // Schema tag preserved (see file header on why the same tag
+        // survives the layout re-lay: the tag names the record
+        // family, consumers select layout by the leading magic +
+        // version).
         mov rdi, 0x536F636B53657301;             // schema tag (SockSessionRecord@0.1)
         lea rsi, [rip + pdxsock_record_buf];
-        mov rdx, 40;                             // record_len (fits in [1, 240])
+        mov rdx, 48;                             // record_len (fits in [1, 240])
         mov rax, 115;
         syscall;
+
+        // ---- sys_write(fd=3, record_ptr, 48). SC+ ID 1. ----
+        //
+        // v1.2-B M3-003 (pdxsock#8): opt-in semantic-pipe emit to fd 3.
+        //
+        // Fd 3 is the first "extra" fd Unix convention lets a parent
+        // pre-wire before execve (`3>&pipe` in a shell); pdxsock never
+        // opens it itself. Downstream consumers (a shell pipeline
+        // sibling, a smoke harness, a session-recorder daemon) that
+        // pre-open fd 3 receive the same 48-byte record the ring path
+        // published above. Absence of fd 3 is the expected default --
+        // sys_write returns -EBADF and this block silently discards
+        // it (no diagnostic on fd 2; the record was already sent to
+        // the ring, and pipe absence is not a session-completion
+        // condition the tool can act on).
+        //
+        // The write is unconditional and un-gated -- there is no
+        // fstat-first probe (which would add a second syscall to
+        // every clean-close for a rarely-wired feature). sys_write's
+        // -EBADF path is O(1) inside the kernel-side fd table
+        // resolver; cost of the "no consumer" case is one syscall.
+        mov rdi, 3;                              // fd = pdxsock_ssr_pipe_fd
+        lea rsi, [rip + pdxsock_record_buf];
+        mov rdx, 48;
+        mov rax, 1;                              // sys_write
+        syscall;
+        // Return value intentionally not inspected -- see block above.
 
         // ---- sys_shutdown(fd, 2 = SHUT_RDWR). SC+ ID 94. ----
         mov rdi, r15;
@@ -1634,7 +1801,7 @@ module Main = structure {
         //   r15 = port_str ptr (read for every mode)
         // Both callee-save; survive every sys_write in the chain.
         //
-        // The 4 KiB pdxsock_buf and the 40-byte pdxsock_record_buf are
+        // The 4 KiB pdxsock_buf and the 48-byte pdxsock_record_buf are
         // intentionally NOT touched at dry-run time -- a --dry-run
         // invocation leaves every socket-side scratch structure at its
         // .bss zero state, making the "we did not run" claim observable

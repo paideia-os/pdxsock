@@ -51,9 +51,11 @@ Two real dispatch paths are wired at v1.2.0:
   (`sys_recv` -> `sys_write` to stdout) until EOF -> `sys_shutdown`
   -> `sys_exit(0)`.
 
-Both paths emit a 40-byte `SockSessionRecord@0.1` via
+Both paths emit a 48-byte `SockSessionRecord@0.1` via
 `sys_semantic_send` (SC+ ID 115) at recv-loop exit, immediately
-before `sys_shutdown` -- see [[cref: RECORD]].
+before `sys_shutdown`, and additionally `sys_write` the same 48
+bytes to fd 3 as an opt-in semantic-pipe (parent pre-wires;
+pdxsock never opens fd 3 itself) -- see [[cref: RECORD]].
 
 `pdxsock` does NOT implement the netcat `-e` exec-on-connect flag
 (a well-known foot-gun). Full-duplex forwarding (netcat's real
@@ -94,57 +96,90 @@ pdxsock#6 (M3-001).
          debuggability]].
 
 ==== RECORD
-Every completed TCP session (client and server) emits one 40-byte
-`SockSessionRecord@0.1` via `sys_semantic_send` (SC+ ID 115) at
-recv-loop exit, immediately before `sys_shutdown`. Failure paths
-before the recv loop (socket / connect / bind / listen / accept
-refusals; usage / bad-port / bad-ip) emit NO record -- there is no
-session to describe.
+Every completed TCP session (client and server) emits one 48-byte
+`SockSessionRecord@0.1` (v1.2-B M3-003; pdxsock#8) via two paths at
+recv-loop exit, immediately before `sys_shutdown`:
+
+1. `sys_semantic_send` (SC+ ID 115) -- always emitted; kernel-side
+   ring receives the record under the schema tag below.
+2. `sys_write(fd=3, record, 48)` -- opt-in semantic-pipe emit. The
+   parent (shell / launcher / smoke harness) pre-wires fd 3 to a
+   pipe / socket / regular file before execve. `pdxsock` never
+   opens fd 3 itself; if fd 3 is not open, `sys_write` returns
+   `-EBADF` and the emit path silently discards -- absence of a
+   consumer is not a session-completion condition.
+
+Failure paths before the recv loop (socket / connect / bind /
+listen / accept refusals; usage / bad-port / bad-ip) emit NO record
+via either path -- there is no session to describe.
 
 Schema tag: `0x536F636B53657301` (ASCII mnemonic "SockSes" + version
-`0x01`). Record layout (little-endian throughout):
+`0x01`; the tag names the record family, not the byte layout --
+consumers select layout by the leading magic + version below).
+
+Record layout (little-endian throughout; 48 bytes @align(8)):
 
     offset  size  field
     ------  ----  ---------------------------------------------
-    +0      u64   bytes_in            (sum of successful sys_recv)
-    +8      u64   bytes_out           (sum of successful sys_send;
-                                       server mode is always 0 --
-                                       server body writes stdout
-                                       only)
-    +16     u64   peer_ip|port|mode   (packed:
-                                        bits [31:0]  = peer IPv4
-                                                       (server = 0)
-                                        bits [47:32] = peer port
-                                        bits [55:48] = mode
-                                                       (0=client,
-                                                        1=server))
-    +24     u64   session_start_ns    (rdtsc snapshot post-connect
-                                       / post-accept)
-    +32     u64   session_end_ns      (rdtsc snapshot at recv-loop
-                                       exit)
+    +0      [u8;8] magic               ("PDXKSOCK" ASCII; the
+                                        little-endian u64
+                                        `0x4B434F534B584450`)
+    +8      u32   version              (SSR_VERSION = 1; consumers
+                                        refuse an unknown version)
+    +12     u32   flags                (reserved; 0 at v1.2-B)
+    +16     u64   bytes_in             (sum of successful sys_recv)
+    +24     u64   bytes_out            (sum of successful sys_send;
+                                        server-mode is potentially
+                                        nonzero at v1.2-A+ -- the
+                                        shared pump does sys_send
+                                        on stdin bytes)
+    +32     u32   peer_ip              (IPv4 peer, host byte order
+                                        from sys_connect input;
+                                        server-mode = 0 -- see
+                                        Field-shape notes)
+    +36     u16   peer_port            (TCP peer port; server-mode
+                                        = 0 -- the LOCAL bind port
+                                        is what the tool holds in
+                                        server mode, and the
+                                        record's peer_* fields
+                                        describe the OTHER end)
+    +38     u16   reserved             (0 at v1.2-B)
+    +40     u64   duration_ns          (session end - session start,
+                                        raw TSC ticks -- see
+                                        Field-shape notes)
 
 Field-shape notes:
 
-- `session_*_ns` fields are **raw TSC ticks**, not nanoseconds. The
-  schema-shape name is preserved so a re-land is field-additive
+- The `PDXKSOCK` magic + `version:u32` header is the generic-tool
+  record contract from `design/networking/r100-user-tools-plan.md`
+  §13.6. A consumer that finds a record beginning with this magic
+  parses under the pdxsock schema without an out-of-band schema-
+  tag lookup. Future record-shape revisions bump `version`; readers
+  that see an unknown version MUST refuse rather than parse.
+- `duration_ns` is **raw TSC ticks**, not nanoseconds. The
+  schema-shape name is preserved so a re-land is field-preserving
   rather than field-renaming once `sys_clock_now` (a user-facing
-  monotonic clock read) lands. Consumers can compute a per-run
-  monotonic duration = `end - start` in TSC ticks; converting to
-  wall-time ns needs a per-host TSC frequency the kernel does not
-  publish. See [[cref: LIMITATIONS]].
-- **Server-mode `peer_ip` is always 0.** `sys_accept` at v1.2.0
+  monotonic clock read) lands. Converting ticks -> wall-time ns
+  needs a per-host TSC frequency the kernel does not publish yet.
+  See [[cref: LIMITATIONS]].
+- **Server-mode `peer_ip` is always 0.** `sys_accept` at v1.2-A
   does not thread an out-address (no `accept4` / `getpeername`
-  shape exists in the kernel). Record encodes this honestly
-  (mode == 1 + peer_ip == 0 is the documented "server-mode, peer
-  address not observed" state rather than a presence flag).
+  shape exists in the kernel). Record encodes this honestly --
+  `peer_ip == 0` combined with `bytes_out > 0` (which server-mode
+  now emits after M2-002's shared-pump landing) is the documented
+  "server-mode, peer address not observed" state rather than a
+  separate presence flag or mode field. The v1.1-B `mode` bit-
+  field the 40-byte record carried was DROPPED at v1.2-B M3-003.
 
-`sys_semantic_send`'s return value (0 / -EFAULT / -EINVAL) is
-intentionally discarded at the callsite: the connection is already
-over, and any failure at this layer is a marshalling bug in
-`src/main.pdx` rather than a per-run condition the caller can act
-on. The sysno-115 handler's overwrite-oldest ring policy means a
-downstream consumer backup does not surface as `PIPE_FULL` at v1
-either -- an older record is silently displaced.
+`sys_semantic_send`'s return value (0 / -EFAULT / -EINVAL) and the
+opt-in fd-3 `sys_write`'s return (n / -EBADF / -EPIPE / etc.) are
+BOTH intentionally discarded at the callsite: the connection is
+already over, and any failure at this layer is either a marshalling
+bug in `src/main.pdx` (ring path) or an absent-consumer default (fd
+path) that the tool cannot act on. The sysno-115 handler's
+overwrite-oldest ring policy means a downstream consumer backup
+does not surface as `PIPE_FULL` at v1 either -- an older record is
+silently displaced.
 
 ==== LIMITATIONS
 This release's stub coverage and honest-scope constraints, spelled
@@ -181,8 +216,8 @@ out so a caller does not mistake absence for a bug:
     layered-tool intent (pdxsock stays plain-TCP; a future
     pdxtls tool wraps it, rather than pdxsock growing a
     `--tls` flag).
-  - **`SockSessionRecord@0.1` timestamps are TSC ticks, not
-    ns.** See [[cref: RECORD]] for the field-additive re-land
+  - **`SockSessionRecord@0.1` `duration_ns` is TSC ticks, not
+    ns.** See [[cref: RECORD]] for the field-preserving re-land
     plan; blocked on user-facing `sys_clock_now`.
   - **Server-mode `peer_ip` is always 0.** See [[cref: RECORD]]
     for the `sys_accept` out-address extension that unblocks
