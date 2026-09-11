@@ -52,14 +52,23 @@ caps_decl   = caps.decl
 # future minor bump without touching the tag surface.
 sources:
   - src/main.pdx                  # v1.1-A + v1.1-B: TCP client/server + semantic-pipe emit
+  - src/audit_wire.pdx            # v1.2-C M3-002 (pdxsock#7): libpdx-audit integration STUB
 
 # --- Library dependencies ----------------------------------------------
 # pdxsock at v1.2.0 depends on nothing outside the SC+ syscall floor
 # (sysnos 87..94 for socket/bind/listen/accept/connect/send/recv/shutdown
 # + 0/1/60 for read/write/exit + 115 for sys_semantic_send). libpdx-net
 # is not consumed at v1.2.0 -- the client and server bodies call the
-# SC+ syscall stubs inline. libpdx-audit is deferred to M3-002 (audit_id
-# threading through SockSessionRecord). libpdx-argv is deferred to
+# SC+ syscall stubs inline. libpdx-audit remains OUT of `deps:` at
+# M3-002 (this landing): the AuditWire callable surface
+# (src/audit_wire.pdx) landed with STUB bodies (`xor rax, rax; ret`)
+# so main.pdx's `_start` has a stable call-site ABI at post-connect,
+# post-accept, and pre-close. Wiring the real libpdx-audit satellite
+# (audit_begin / audit_record_output / audit_commit) is tracked as
+# `pdxsock.M3-002-b`: (a) add libpdx-audit to this `deps:` list;
+# (b) add `KIND_IPC_ENDPOINT(write, svc.audit-journal) via svc_lookup`
+# to caps.decl; (c) swap AuditWire STUB bodies for real audit calls
+# without touching main.pdx call sites. libpdx-argv is deferred to
 # M1-002 (argv scanner extraction).
 deps: []
 

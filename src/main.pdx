@@ -522,6 +522,36 @@ module Main = structure {
   // -----------------------------------------------------------------
   pub let mut pdxsock_record_buf         : [u8; 48] = uninit @align(8)
   pub let mut pdxsock_session_start_ns   : u64      = 0
+
+  // -----------------------------------------------------------------
+  // pdxsock_session_duration_ns -- session-close audit-call scratch
+  //
+  // Wave: R100  Milestone: M3-002 (pdxsock#7, libpdx-audit integration)
+  // Doc:  src/audit_wire.pdx file header (audit-buffer sizing section)
+  //
+  // A dedicated .bss u64 slot that caches (session_end_ns -
+  // session_start_ns) across the AuditWire::pdxsock_audit_session_
+  // close call at the head of pdxsock_emit_session_and_exit. Rationale:
+  // the audit call site passes duration in rdx (arg 3) but the marshal
+  // block that follows the call reads duration back from rax (into
+  // record[+40]). Under SysV, rax is caller-save -- the AuditWire STUB
+  // clobbers it with its own return (0). Rather than shuffle duration
+  // into a callee-save register (all of r12/r13/r14/r15/rbx/rbp are
+  // live with the emit-block state), we stash the u64 in .bss BEFORE
+  // the audit call and reload it into rax AFTER the call returns.
+  //
+  // Cost: 8 bytes .bss, one store, one load per emit -- negligible on
+  // the once-per-run emit path.
+  //
+  // Retire this slot in the swap-to-real M3-002-b landing IF the real
+  // audit call is instead ordered AFTER the sys_semantic_send marshal
+  // (i.e. semantic-pipe first, audit second). The current placement
+  // (audit first) is chosen so a security-review reader of the audit
+  // journal sees the session-close event before the semantic-pipe
+  // consumer sees the record -- audit is the security surface and
+  // must not lag observability.
+  // -----------------------------------------------------------------
+  pub let mut pdxsock_session_duration_ns : u64      = 0
   pub let pdxsock_schema_sock_session    : u64      = 0x536F636B53657301
   // ssr_magic and ssr_version_and_flags are u64 (not u32/u8) because
   // every existing pub-let constant in the user src tree is u64 and
@@ -1047,6 +1077,46 @@ module Main = structure {
         shl rdx, 32;                             // reconstruct u64 in rax
         or rax, rdx;
         mov [rip + pdxsock_session_start_ns], rax;
+
+        // v1.2-C (issue #7, M3-002) STUB(libpdx-audit): SESSION_START.
+        //
+        // audit-wire hook fired post-connect so a security reviewer
+        // walking the audit journal sees the connect event before any
+        // socket byte moves. Passes the client-mode triple (peer_ip,
+        // peer_port, mode = 0) to AuditWire::pdxsock_audit_session_
+        // start, whose STUB body no-ops and returns AUDIT_OK (0).
+        //
+        // SysV alignment: at _start entry rsp % 16 == 0 (ELF ABI's
+        // process-initialisation posture, distinct from the post-
+        // `call` rsp % 16 == 8 posture a function entry inherits).
+        // Nothing has been pushed to the stack up to this point in
+        // _start, so rsp % 16 is still 0 -- which IS the pre-call
+        // posture the compliance flag `sysv-push-pop-parity` names
+        // ("rsp % 16 == 0 at every nested call"). No `sub rsp, 8`
+        // is needed here; the plain `call` instruction is
+        // encoder-valid. Matches the mkfs.pdxfs precedent (src/main.
+        // pdx line 375 `call mkfs_audit_begin` -- same _start-to-
+        // audit-wire pattern, same no-prologue call).
+        //
+        // Register discipline: rbp (peer_ip) and rbx (peer_port) are
+        // SysV callee-save, so the AuditWire STUB preserves them
+        // automatically -- their post-call values match their pre-
+        // call ones by ABI. r12/r13/r14/r15 (bytes_in/bytes_out/
+        // mode/fd) are likewise callee-save and survive intact. rax
+        // post-call = 0 (STUB); nothing lives in rax here so the
+        // clobber is invisible.
+        //
+        // Return value intentionally NOT gated at STUB level: a
+        // future landing where audit-broker failure MUST abort the
+        // run will add a `cmp rax, 0; jne pdxsock_audit_fail`
+        // branch here. At STUB, treating a 0 as "audit not wired;
+        // carry on" matches the AuditWire body's docstring contract
+        // and mirrors mkfs.pdxfs's "forgiving posture" (src/audit_
+        // wire.pdx module header).
+        mov rdi, rbp;                            // peer_ip (u32-in-u64)
+        mov rsi, rbx;                            // peer_port (u16-in-u64)
+        xor rdx, rdx;                            // mode = 0 (tcp-client)
+        call pdxsock_audit_session_start;
 
         // v1.1-A' (issue #4, M2-001) bidirectional pump.
         //
@@ -1579,6 +1649,29 @@ module Main = structure {
         or rax, rdx;
         mov [rip + pdxsock_session_start_ns], rax;
 
+        // v1.2-C (issue #7, M3-002) STUB(libpdx-audit): SESSION_START
+        // (server-mode peer).
+        //
+        // Symmetric to the client-mode audit hook post-connect: fires
+        // immediately after sys_accept success and before the pump.
+        // Server mode passes peer_ip = 0 and peer_port = 0 because
+        // sys_accept at MVP does not thread an out-address (see file
+        // header + server-body comment). mode = 1 distinguishes the
+        // record from client-side SESSION_START. AuditWire STUB
+        // no-ops and returns AUDIT_OK (0); see the client-side hook
+        // above for the SysV alignment and register-safety rationale
+        // (same discipline: nothing on the stack at this point, so
+        // sub-8 / call / add-8 is the only alignment work needed).
+        //
+        // If sys_accept later grows a peer-address out-param (a
+        // future recvfrom-shaped landing per §7.2), this hook picks
+        // up the real peer_ip / peer_port and the mode = 1 argument
+        // is unchanged.
+        xor rdi, rdi;                            // peer_ip = 0 (accept MVP)
+        xor rsi, rsi;                            // peer_port = 0
+        mov rdx, 1;                              // mode = 1 (tcp-server)
+        call pdxsock_audit_session_start;
+
         // v1.2-A: reuse the client-side bidirectional pump verbatim.
         // Register layout at entry matches what pdxsock_pump_loop
         // expects: r15 = connection fd, r12 = bytes_in accumulator,
@@ -1639,6 +1732,49 @@ module Main = structure {
         // is silently dropping the record, which loses information).
         mov r11, [rip + pdxsock_session_start_ns];
         sub rax, r11;                            // rax = duration_ns (TSC ticks)
+
+        // v1.2-C (issue #7, M3-002) STUB(libpdx-audit): SESSION_CLOSE.
+        //
+        // audit-wire hook fired pre-shutdown so a security reviewer
+        // walking the audit journal sees the session-close event
+        // (with bytes-in / bytes-out / duration) before the
+        // semantic-pipe consumer sees the record via
+        // sys_semantic_send. Passes the close triple (bytes_in,
+        // bytes_out, duration_ns) to AuditWire::pdxsock_audit_session_
+        // close, whose STUB body no-ops and returns AUDIT_OK (0).
+        //
+        // Duration cache: the audit call's return clobbers rax (SysV
+        // caller-save), so the marshal block below can no longer
+        // read the duration back from rax as originally written.
+        // Solution: store duration into pdxsock_session_duration_ns
+        // @.bss BEFORE the call, reload from .bss AFTER the call, and
+        // leave the marshal block's `mov [r10 + 40], rax` at the tail
+        // intact. Cost: 8 bytes .bss + one store + one load, once per
+        // emit (see pdxsock_session_duration_ns file-scope doc).
+        //
+        // SysV alignment: identical shape to the two SESSION_START
+        // hooks -- the emit block is reached via `jmp` (from either
+        // pdxsock_client_close's fall-through or the server-body's
+        // direct branch), so no return address is queued and rsp %
+        // 16 remains 0 (its ELF-entry posture). Plain `call`
+        // suffices; no `sub rsp, 8` prologue needed. Matches the
+        // mkfs.pdxfs precedent (main.pdx line 402 `call mkfs_audit_
+        // commit`, same _start-tail-to-audit-wire pattern).
+        //
+        // Register discipline: r12 (bytes_in), r13 (bytes_out),
+        // r14 (mode), r15 (fd), rbx (port), rbp (peer_ip) are all
+        // SysV callee-save and survive the AuditWire STUB intact.
+        // rdi/rsi/rdx (caller-save args) may be trashed by any
+        // future real body but at STUB level the STUB does not
+        // touch them -- and the marshal block that follows re-
+        // initialises rdi/rsi/rdx from scratch for
+        // sys_semantic_send anyway.
+        mov [rip + pdxsock_session_duration_ns], rax; // cache duration
+        mov rdi, r12;                            // bytes_in
+        mov rsi, r13;                            // bytes_out
+        mov rdx, rax;                            // duration_ns
+        call pdxsock_audit_session_close;
+        mov rax, [rip + pdxsock_session_duration_ns]; // reload duration for marshal
 
         // ---- Marshal the 48-byte SockSessionRecord@0.1 (v1.2-B M3-003). ----
         //

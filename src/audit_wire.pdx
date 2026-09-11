@@ -1,0 +1,226 @@
+// src/audit_wire.pdx -- pdxsock M3-002 libpdx-audit integration wire (STUB)
+//
+// Wave: R100  Milestone: M3-002 (pdxsock#7)
+// Doc:  design/networking/r100-user-tools-plan.md §13.6 (paideia-os)
+//       + design/tooling/r49-r50-plan.md §3.4         (libpdx-audit contract)
+//
+// Purpose ---------------------------------------------------------------
+// AuditWire is pdxsock's single-file surface for the audit-journal
+// integration named at §13.6 of the R100 user-tools plan: every
+// completed pdxsock session emits an audit-trail entry (SESSION_START
+// at connect / accept, SESSION_CLOSE at pre-shutdown) so a security
+// reviewer walking the audit journal can reconstruct network activity
+// without needing the semantic-pipe ring.
+//
+// The two pub-let entry points defined here --
+// `pdxsock_audit_session_start` and `pdxsock_audit_session_close` --
+// are the callable surface `_start` in main.pdx hooks. Their argument
+// ABIs are FROZEN at this landing (peer_ip / peer_port / mode for the
+// start half; bytes_in / bytes_out / duration_ns for the close half)
+// so a future landing that swaps the STUB body for real libpdx-audit
+// calls need touch only THIS file, not main.pdx.
+//
+// STUB status (M3-002 landing) -----------------------------------------
+// The library `paideia-os/libpdx-audit` is not yet in pdxsock's
+// `manifest.pdxproj` `deps:` list -- its dispatch table lives in a
+// separate satellite ELF whose cross-repo link path is not stitched at
+// this milestone. Threading a real dep would additionally require
+// `pdxsock`'s `caps.decl` to acquire `KIND_IPC_ENDPOINT(write,
+// svc.audit-journal) via svc_lookup` (see libpdx-audit/caps.decl) and
+// a `KIND_USER` invoker reference the R100 wave has already listed
+// mandatory. Both are follow-up items tracked as `pdxsock.M3-002-b:
+// add libpdx-audit dep to manifest + caps.decl + swap AuditWire STUB
+// body for real audit_begin / audit_record_output / audit_commit
+// calls`.
+//
+// Until that lands, both entry points execute a no-op body --
+// `xor rax, rax; ret` -- and return 0 (matching libpdx-audit's
+// `AUDIT_OK = 0` convention). `main.pdx`'s `_start` reads that
+// return but treats a 0 as "audit not yet wired; carry on"; a future
+// landing where an audit-broker failure MUST kill the run will
+// introduce a distinct return-value convention (already matches
+// libpdx-audit's `AUDIT_ERR_* != 0` shape).
+//
+// Effects declaration --------------------------------------------------
+// The STUB body touches neither memory nor sysregs, but the DECLARED
+// effect set is `!{mem, sysreg} @{cap, sched}` -- the same set the
+// real libpdx-audit body will require (`audit_begin` /
+// `audit_record_output` / `audit_commit` all declare
+// `!{mem, sysreg} @{cap, sched}` per libpdx-audit's audit_client.pdx).
+// Declaring the wider set NOW means the swap-to-real landing changes
+// only body bytes, not the pub-let signature -- callers in main.pdx
+// need no re-typing when the body flips from no-op to real.
+//
+// `_start` already declares `!{mem, sysreg} @{fs, sched, cap}` so
+// this callee's effect / cap set is a strict subset (cap and sched
+// both present in the caller) -- the call is well-typed under the
+// pdxsock effect algebra.
+//
+// Event kinds ----------------------------------------------------------
+// The wire uses two STUB event codes at this milestone:
+//   `PSAW_EVENT_SESSION_START = 200`   (chose 200/201 to sit clear of
+//   `PSAW_EVENT_SESSION_CLOSE = 201`    libpdx-audit's own tool-life-
+//                                        cycle codes UEJ_KIND_TOOL_
+//                                        INVOKE=130, TOOL_OUTPUT=132,
+//                                        TOOL_EXIT=133 per libpdx-
+//                                        audit/design/architecture.md
+//                                        §5.13)
+// These are documentation-only at STUB level -- the STUB body does
+// not read them. When the swap-to-real landing wires
+// `audit_send_record`, they will feed into the `event_kind` arg. If
+// libpdx-audit assigns its own canonical `SESSION_*` codes in a
+// future revision, this file updates the two constants; call sites
+// in main.pdx are unaffected.
+//
+// Audit-buffer sizing --------------------------------------------------
+// `PSAW_AUDIT_RECORD_LEN = 256` documents the byte count the real
+// body will marshal into -- libpdx-audit's `PdxAuditRecord@0.2` is a
+// 256-byte hybrid record per libpdx-audit#11 + #12 (five u64 numeric
+// words at the head, string tail behind them). The STUB body does
+// not allocate this buffer; a future landing declares a
+// `pdxsock_audit_record_buf : [u8; 256] @align(8)` in main.pdx's
+// .bss alongside `pdxsock_record_buf` (the 48-byte
+// `SockSessionRecord@0.1` buffer). Two separate buffers -- the
+// SockSessionRecord@0.1 body-pipe emit (unchanged from v1.2-B) and
+// the audit-journal PdxAuditRecord@0.2 payload -- because they
+// travel to distinct consumers (semantic-pipe ring / fd-3 vs. the
+// audit journal IPC endpoint) with distinct schemas.
+//
+// The `SockSessionRecord@0.1` emit at `sys_semantic_send` (SC+ ID
+// 115) is NOT DISPLACED by this integration. Both records travel
+// on every completed session; the audit-journal path is a security
+// review surface, the semantic-pipe path is an observability /
+// automation surface, and they carry overlapping but not identical
+// data. The bytes-in/out counters live once in `_start`'s r12/r13
+// and land in BOTH records via distinct marshal blocks.
+//
+// Encoder discipline (per user memory `pdx encoder pitfalls`) -----------
+//   * no `test rN, rN` (every zero-check is `cmp reg, 0`)
+//   * byte loads via `xor rax, rax; mov_b rax, [ptr]` (unused at STUB)
+//   * no 2-op `imul r, imm`
+//   * no `and reg, imm64` on r8..r15
+//   * PascalCase module basename (`AuditWire` from `audit_wire.pdx`)
+//   * every label prefixed `psaw_` per the wire-namespace convention
+//     the task charter names for this file
+//   * SysV push/pop parity: leaf body touches no stack
+
+module AuditWire = structure {
+
+  // -------------------------------------------------------------------
+  // Event-kind constants (STUB values; see file header for allocation
+  // rationale). Kept as `pub let` u64 constants mirroring the pattern
+  // `pdxsock_ssr_magic` / `pdxsock_schema_sock_session` established in
+  // main.pdx. Not consumed at STUB level (the STUB body does not load
+  // them), but present so:
+  //   (a) `grep PSAW_EVENT_SESSION` in the pdxsock tree surfaces the
+  //       wire-visible event names at any git-blame moment, and
+  //   (b) the swap-to-real landing loads them via `mov r64, imm64`
+  //       (movabs) or `mov rax, [rip + PSAW_EVENT_SESSION_START]`
+  //       without inventing a symbol.
+  // -------------------------------------------------------------------
+  pub let PSAW_EVENT_SESSION_START : u64 = 200
+  pub let PSAW_EVENT_SESSION_CLOSE : u64 = 201
+
+  // Audit-buffer sizing: documented at file-scope so the swap-to-real
+  // landing does not need to invent one. Matches libpdx-audit's
+  // `PdxAuditRecord@0.2` fixed 256-byte record.
+  pub let PSAW_AUDIT_RECORD_LEN    : u64 = 256
+
+  // -------------------------------------------------------------------
+  // pdxsock_audit_session_start(peer_ip, peer_port, mode) -> u64
+  //
+  //   rdi = peer_ip     (u32-shaped u64; 0 in server mode -- accept
+  //                       does not thread a peer-address out-param
+  //                       at MVP, per main.pdx `pdxsock_server_body`
+  //                       comment)
+  //   rsi = peer_port   (u16-shaped u64; 0 in server mode)
+  //   rdx = mode        (0 = tcp-client, 1 = tcp-server; matches the
+  //                       `r14` mode convention `_start` already uses)
+  //   rax = 0 on success (STUB always returns 0)
+  //
+  // Called from main.pdx immediately after `sys_connect` (client path)
+  // or `sys_accept` (server path) returns success. At STUB level,
+  // discards every argument and returns 0.
+  //
+  // Register discipline: pure leaf, no callee-save touched. `rax` is
+  // the only write. `rdi`/`rsi`/`rdx` (args) are caller-save --
+  // pdxsock's `_start` pushes nothing before the call, so their
+  // post-call value is immaterial to the caller.
+  //
+  // Future real body will:
+  //   * marshal a `PdxAuditRecord@0.2` payload from the three args
+  //     plus `event_kind = PSAW_EVENT_SESSION_START` and `ts_ns` from
+  //     an `rdtsc` snapshot
+  //   * call `AuditClient::audit_begin(op_name = "pdxsock",
+  //     op_args = <mode-string>)` to allocate an `audit_id`
+  //   * call `AuditClient::audit_record_output(audit_id,
+  //     schema = PdxAuditRecord@0.2 tag, hash = BLAKE3(payload))`
+  //   * return the `audit_id` (nonzero on success) so the pre-close
+  //     path can thread it into the SESSION_CLOSE record via
+  //     `audit_set_parent`
+  // -------------------------------------------------------------------
+  pub let pdxsock_audit_session_start : (u64, u64, u64) -> u64
+    !{mem, sysreg} @{cap, sched} =
+    fn (peer_ip: u64) (peer_port: u64) (mode: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap, sched},
+      justification: "pdxsock.M3-002 (pdxsock#7) libpdx-audit integration STUB (SESSION_START half). paideia-os/libpdx-audit is not yet in pdxsock's manifest.pdxproj deps at this landing -- see file header on M3-002-b follow-up. STUB body is `xor rax, rax; ret`: sets the AUDIT_OK (0) return, no memory or sysreg touch. Declared effect set !{mem, sysreg} @{cap, sched} intentionally mirrors what the swap-to-real body will require (AuditClient::audit_begin + audit_record_output both declare !{mem, sysreg} @{cap, sched} per libpdx-audit/src/audit_client.pdx) so main.pdx's caller-side call encoding survives the swap without re-typing. Arg ABI frozen: rdi = peer_ip (u32-in-low-32; server = 0), rsi = peer_port (u16-in-low-16; server = 0), rdx = mode (0 = tcp-client, 1 = tcp-server, matches _start's r14 convention). Return value 0 at STUB matches libpdx-audit's AUDIT_OK sentinel; the future real body returns an audit_id (nonzero on success) and a nonzero AUDIT_ERR_* on failure. Register discipline: pure leaf -- writes only rax, touches no callee-save, needs no push/pop, needs no stack. rdi/rsi/rdx (caller-save args) may be freely trashed by any future body. Encoder: `xor rN, rN` for the zero-return (paideia-as encodes as `xor r/m64, r64` REX.W pair, valid on rax); `ret` is the 0xC3 near-return -- SysV stack posture at entry is `[rsp] = return address` (call pushed 8 bytes -> rsp % 16 == 0 at callee), and since this leaf touches no stack it exits with the same posture. No `test`, no 2-op `imul`, no `and reg, imm64` on r8..r15 -- STUB body uses none of them. Label prefix psaw_ per the user memory rule -- no branch labels in this body, so the prefix requirement is trivially satisfied.",
+      block: {
+        // STUB(libpdx-audit): swap this body for a real
+        // `audit_begin` + `audit_record_output` pair once
+        // libpdx-audit lands in pdxsock's `deps` and pdxsock's
+        // `caps.decl` acquires the audit-journal endpoint grant.
+        // Until then, no-op returning AUDIT_OK (0) so the caller's
+        // post-call gate treats "audit not wired" as
+        // indistinguishable from "audit succeeded".
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // -------------------------------------------------------------------
+  // pdxsock_audit_session_close(bytes_in, bytes_out, duration_ns) -> u64
+  //
+  //   rdi = bytes_in     (u64 accumulator from `_start`'s r12)
+  //   rsi = bytes_out    (u64 accumulator from `_start`'s r13)
+  //   rdx = duration_ns  (u64 TSC-tick delta from `_start`'s pre-
+  //                        marshal `sub rax, [start_ns]`; see main.pdx
+  //                        file header on the ns / TSC-tick caveat --
+  //                        semantics are cycle counts until user-facing
+  //                        `sys_clock_now` lands)
+  //   rax = 0 on success (STUB always returns 0)
+  //
+  // Called from main.pdx at the head of
+  // `pdxsock_emit_session_and_exit`, BEFORE the
+  // `sys_semantic_send` -> `sys_write(3,...)` -> `sys_shutdown` ->
+  // `sys_exit(0)` tail. Discards every argument at STUB level.
+  //
+  // Future real body will:
+  //   * marshal `PdxAuditRecord@0.2` payload from args plus
+  //     `event_kind = PSAW_EVENT_SESSION_CLOSE`, `ts_ns` from
+  //     `rdtsc`, and (once SESSION_START returned a real
+  //     `audit_id`) parent linkage via
+  //     `AuditClient::audit_set_parent`
+  //   * call `AuditClient::audit_record_output(audit_id, schema,
+  //     hash)` followed by `AuditClient::audit_commit(audit_id,
+  //     exit_code = 0)` to close the audit
+  // -------------------------------------------------------------------
+  pub let pdxsock_audit_session_close : (u64, u64, u64) -> u64
+    !{mem, sysreg} @{cap, sched} =
+    fn (bytes_in: u64) (bytes_out: u64) (duration_ns: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap, sched},
+      justification: "pdxsock.M3-002 (pdxsock#7) libpdx-audit integration STUB (SESSION_CLOSE half). Symmetric peer of pdxsock_audit_session_start -- same STUB shape (xor rax, rax; ret), same declared effect/cap set (!{mem, sysreg} @{cap, sched}, mirroring the future audit_record_output + audit_commit tail per libpdx-audit/src/audit_client.pdx), same STUB return value 0 (AUDIT_OK). Arg ABI frozen: rdi = bytes_in (u64, from _start's r12 accumulator over sys_recv returns), rsi = bytes_out (u64, from _start's r13 accumulator over sys_send returns), rdx = duration_ns (u64, computed at emit_session_and_exit as `session_end_ns - session_start_ns` in TSC ticks -- semantics stable across the ticks->ns rename that sys_clock_now will eventually enable). Register discipline: pure leaf, writes only rax, touches no callee-save, needs no push/pop, needs no stack. Encoder discipline identical to pdxsock_audit_session_start (no test, no 2-op imul, no wide-and on r8..r15, no branch labels so psaw_ prefix requirement is trivially satisfied). Future real body will also load PSAW_EVENT_SESSION_CLOSE via `mov rax, [rip + PSAW_EVENT_SESSION_CLOSE]` (rip-relative u64 load, proven at sys_semantic_send.pdx line 214) before threading it into audit_send_record.",
+      block: {
+        // STUB(libpdx-audit): swap this body for a real
+        // `audit_record_output` + `audit_commit` pair once
+        // libpdx-audit lands in pdxsock's `deps`. Until then,
+        // no-op returning AUDIT_OK (0) so the caller's post-call
+        // gate treats "audit not wired" as indistinguishable from
+        // "audit succeeded".
+        xor rax, rax;
+        ret;
+      }
+    }
+
+}

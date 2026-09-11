@@ -17,6 +17,63 @@ Version discipline:
 
 ## [Unreleased]
 
+### Added
+- **`libpdx-audit` integration wire STUB (pdxsock#7, M3-002).** Adds
+  `src/audit_wire.pdx` (module `AuditWire`, two `pub let` entry
+  points: `pdxsock_audit_session_start(peer_ip, peer_port, mode)`
+  and `pdxsock_audit_session_close(bytes_in, bytes_out,
+  duration_ns)`) as the callable audit-journal surface for every
+  completed pdxsock session. Both entry points ship at STUB status
+  (`xor rax, rax; ret` body, returns `AUDIT_OK = 0`) because the
+  `paideia-os/libpdx-audit` satellite is not yet in pdxsock's
+  `manifest.pdxproj` `deps:` list. Declared effect / capability set
+  (`!{mem, sysreg} @{cap, sched}`) matches the future real-body
+  requirement (`AuditClient::audit_begin` /
+  `audit_record_output` / `audit_commit`) so the swap-to-real
+  landing (`pdxsock.M3-002-b`) needs only body-byte changes, not a
+  `pub-let` signature edit or a main.pdx call-site edit.
+
+  Two STUB event-kind constants land alongside:
+  `PSAW_EVENT_SESSION_START = 200` and `PSAW_EVENT_SESSION_CLOSE =
+  201` (chose 200/201 to sit clear of libpdx-audit's own tool-
+  lifecycle codes `UEJ_KIND_TOOL_INVOKE = 130`,
+  `UEJ_KIND_TOOL_OUTPUT = 132`, `UEJ_KIND_TOOL_EXIT = 133`);
+  documentation-only at STUB level. `PSAW_AUDIT_RECORD_LEN = 256`
+  documents the byte count the future real body will marshal into
+  (matching libpdx-audit's `PdxAuditRecord@0.2` 256-byte fixed
+  record). The audit-journal record is DISTINCT from the existing
+  48-byte `SockSessionRecord@0.1` -- they travel to distinct
+  consumers (audit-journal IPC endpoint vs. semantic-pipe ring +
+  fd 3) with distinct schemas. `SockSessionRecord@0.1` at
+  `sys_semantic_send` and `sys_write(3, ..)` is NOT displaced by
+  this integration; the bytes-in/out counters live once in
+  `_start`'s r12/r13 and land in both records via distinct marshal
+  blocks.
+
+  `main.pdx` gains three call sites -- post-connect (client-mode
+  `SESSION_START` with peer_ip = rbp / peer_port = rbx / mode = 0),
+  post-accept (server-mode `SESSION_START` with peer_ip = 0 /
+  peer_port = 0 / mode = 1), and pre-close at the head of
+  `pdxsock_emit_session_and_exit` (`SESSION_CLOSE` with
+  bytes_in = r12 / bytes_out = r13 / duration_ns from the
+  freshly-computed rax). Each site follows the SysV alignment
+  discipline (`sub rsp, 8` before `call`, `add rsp, 8` after) --
+  the first cross-module `call` encoding this codebase exercises
+  from within `_start`, retiring the file-header note that flagged
+  it as future-work. A new `.bss` slot
+  `pdxsock_session_duration_ns : u64 = 0` carries duration across
+  the pre-close call (SysV callers must budget for `rax` clobber).
+
+  Follow-up work in `pdxsock.M3-002-b`: add libpdx-audit to
+  `manifest.pdxproj` `deps:`, extend `caps.decl` with
+  `KIND_IPC_ENDPOINT(write, svc.audit-journal) via svc_lookup`,
+  and replace the two `xor rax, rax; ret` STUB bodies in
+  `src/audit_wire.pdx` with real `audit_begin` /
+  `audit_record_output` / `audit_commit` sequences. No `main.pdx`
+  edits will be needed for the swap.
+
+  Closes #7.
+
 ### Changed
 - **`SockSessionRecord@0.1` re-lay to the R100 §13.6 generic-tool
   contract (pdxsock#8, M3-003).** Retires the v1.1-B 40-byte layout
