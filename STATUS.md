@@ -76,13 +76,28 @@ See `design/networking/r100-user-tools-plan.md` §13.6 in the
       shutdown + exit all wired. Full-duplex bidirectional forward-
       ing (netcat's real contract, requires sysno 102 poll) held for
       a follow-on v1.1-A' issue rather than crammed into #15.
-- [~] **M2-002** -- TCP server: bind+listen+accept, single-
-      connection-at-a-time. **Met** by v1.1-A: bind + listen (back-
-      log 8) + accept (blocking) + recv-to-stdout loop + shutdown +
-      exit. The listen fd is not explicitly sys_closed before exit
-      -- `sys_exit(0)` reaps the whole task and releases every cap
-      slot, so the un-closed listen fd is not a leak (matches every
-      other _start in the paideia-os src/user/ tree).
+- [x] **M2-002** -- TCP server: bind+listen+accept, single-
+      connection-at-a-time. Met by v1.2-A (pdxsock#5): sys_socket
+      -> sys_bind(fd, port) (INADDR_ANY implicit; kernel bind ABI
+      is (fd, local_port), single-interface tree) -> sys_listen(fd,
+      backlog=1) (single-connection scope; matches the kernel's
+      MVP one-slot backlog) -> sys_accept(fd) (blocking per
+      R94.M4-001). On accept success the server jumps directly
+      into the shared `pdxsock_pump_loop` (bidirectional stdin<->
+      socket pump landed at M2-001 pdxsock#4) with r15 = accepted
+      fd, r12/r13 = 0, r14 = 1 (mode), rbp = 0 (no peer_ip at
+      MVP). Pump exits into `pdxsock_client_close` whose prefix
+      is now mode-picked ("pdxsock tcp-server bytes-in=..." for
+      r14==1). New fingerprint band on fd 2: "pdxsock tcp-server
+      listening ok port=<P>\n" (post-listen), "pdxsock tcp-server
+      accept ok fd=<N>\n" (post-accept), "pdxsock tcp-server
+      bytes-in=<N> bytes-out=<M>\n" (close). Concurrent-client
+      fan-out is EXPLICITLY out of scope at v1 -- deferred to a
+      later milestone when M4 smoke traffic drives it. The listen
+      fd is not explicitly sys_closed before exit -- `sys_exit(0)`
+      reaps the whole task and releases every cap slot, so the
+      un-closed listen fd is not a leak (matches every other
+      _start in the paideia-os src/user/ tree).
 
 ### M3 -- UDP + audit + semantic-pipe
 

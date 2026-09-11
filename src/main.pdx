@@ -22,16 +22,25 @@
 //     sys_shutdown(fd, 2 = SHUT_RDWR)          SC+ ID 94
 //     sys_exit(0)                              SC+ ID 60
 //
-//   Server mode (`pdxsock -l <port>`):
+//   Server mode (`pdxsock -l <port>`) -- v1.2-A M2-002 shape:
 //     sys_socket(AF_INET=2, SOCK_STREAM=1, 0)  SC+ ID 87
-//     sys_bind(fd, port)                       SC+ ID 88
-//     sys_listen(fd, backlog=8)                SC+ ID 89
-//     sys_accept(fd)                           SC+ ID 90  -> new fd
-//     loop: sys_recv(new_fd, buf, 4096)        SC+ ID 93
-//           sys_write(1, buf, n)               SC+ ID 1
-//           break when recv returns <= 0
-//     sys_shutdown(new_fd, 2)                  SC+ ID 94
-//     sys_exit(0)                              SC+ ID 60
+//     sys_bind(fd, port)                       SC+ ID 88  (INADDR_ANY implicit)
+//     sys_listen(fd, backlog=1)                SC+ ID 89  (single-connect at v1)
+//     (fingerprint: "pdxsock tcp-server listening ok port=<P>\n")
+//     sys_accept(fd)                           SC+ ID 90  -> new fd (blocks)
+//     (fingerprint: "pdxsock tcp-server accept ok fd=<N>\n")
+//     -> reuses `pdxsock_pump_loop` (shared bidirectional pump body):
+//        loop: sys_read(0, buf, 4096)   SC+ ID 0
+//              sys_send(new_fd, buf, n) SC+ ID 92
+//              sys_recv(new_fd, buf, 4096) SC+ ID 93
+//              sys_write(1, buf, n)     SC+ ID 1
+//              break when any side EOFs or errors
+//     -> reuses `pdxsock_client_close` (mode-picked prefix on r14):
+//        (fingerprint: "pdxsock tcp-server bytes-in=<N> bytes-out=<M>\n")
+//     -> reuses `pdxsock_emit_session_and_exit` (semantic-pipe tail):
+//        sys_semantic_send(schema, rec_ptr, rec_len)  SC+ ID 115
+//        sys_shutdown(new_fd, 2)                      SC+ ID 94
+//        sys_exit(0)                                  SC+ ID 60
 //
 // v1.1-A' "bidirectional TCP client pump" scope (issue #4, M2-001)
 // -----------------------------------------------------------------
@@ -75,9 +84,42 @@
 // milestone. True full-duplex re-lands once TCP RX wake or a
 // non-blocking sys_read on stdin exists.
 //
-// The server body is UNCHANGED at v1.1-A' -- the M2-001 fingerprint
-// band and pump loop are client-only surfaces. Server continues to
-// jump straight to pdxsock_emit_session_and_exit on recv-loop exit.
+// v1.2-A "TCP server: bind+listen+accept + shared pump" scope
+// -----------------------------------------------------------------
+// (issue #5, M2-002)
+//
+// Retires v1.1-A's recv-only server body (sys_recv -> sys_write ->
+// break) in favour of the bidirectional pump the client-side gained
+// at v1.1-A'. The server-body setup path (socket, bind, listen with
+// backlog=1, accept) is unchanged in shape; on accept success the
+// server jumps directly into `pdxsock_pump_loop` -- the same label
+// the client falls into after sys_connect success -- with r15 =
+// accepted fd, r12/r13 zeroed, r14 = 1 (mode), rbp = 0 (no peer_ip
+// threaded through sys_accept at MVP). The pump exits into the
+// shared `pdxsock_client_close` tail whose prefix write is now mode-
+// picked (r14 == 0 -> "pdxsock tcp-client bytes-in=", r14 == 1 ->
+// "pdxsock tcp-server bytes-in="; both are 28 wire bytes so the
+// shared `mov rdx, 28; syscall` needs no branch on length).
+//
+// New fingerprint band on fd 2 (stderr):
+//   pdxsock tcp-server listening ok port=<P>\n   (post-listen)
+//   pdxsock tcp-server accept ok fd=<N>\n        (post-accept)
+//   pdxsock tcp-server bytes-in=<N> bytes-out=<M>\n (close tail)
+//
+// Concurrent-client fan-out is EXPLICITLY out of scope at M2-002 --
+// a process-per-connection or event-loop design is not warranted
+// before M4 smoke traffic drives the requirement. The kernel's MVP
+// single-slot backlog per sys_listen.pdx header is the honest cap.
+//
+// Kernel bind/listen/accept ABI observed:
+//   sys_bind(fd, local_port) -- no sockaddr; local IP stamped from
+//     the interface's _ipv4_my_ip on KIND_TCP_SOCKET. "INADDR_ANY"
+//     is what the tool documents; single-interface kernel is what
+//     materially delivers it.
+//   sys_listen(fd, backlog)  -- backlog ignored (kernel is a single-
+//     slot pending queue); tool passes 1 to match the M2-002 scope.
+//   sys_accept(fd)           -- blocking (R94.M4-001 waiter table);
+//     returns new fd (KIND_TCP_SOCKET child) or -errno.
 //
 // v1.1-B "semantic-pipe emission wire" scope (issue #16)
 // -------------------------------------------------------
@@ -90,8 +132,11 @@
 //
 //   [ +0]  bytes_in         u64   -- socket->local octets (sys_recv sum)
 //   [ +8]  bytes_out        u64   -- local->socket octets (sys_send sum);
-//                                    always 0 in server mode at v1.1-B
-//                                    (the server body writes stdout only)
+//                                    at v1.2-A M2-002 the server body
+//                                    reuses the shared bidirectional
+//                                    pump and can accumulate a nonzero
+//                                    bytes_out (retires the v1.1-B
+//                                    "server always 0" note).
 //   [+16]  peer_ip_port_mode u64  -- packed:
 //                                     bits [ 0..31] = peer_ip u32 (server=0
 //                                                    since sys_accept at
@@ -342,6 +387,52 @@ module Main = structure {
 
   pub let pdxsock_msg_close_mid        : [u8; 12] = " bytes-out=\0"
   pub let pdxsock_msg_close_mid_len    : u64      = 11
+
+  // -----------------------------------------------------------------
+  // v1.2-A TCP server fingerprint band (issue #5, M2-002).
+  //
+  // Three grep-searchable status lines on fd 2 (stderr) that frame every
+  // TCP server run. The band mirrors the v1.1-A' client band; it lands
+  // here because M2-002 replaces the v1.1-A recv-only server tail with
+  // the shared bidirectional pump (see `_start` server-body section),
+  // and once server-mode reuses `pdxsock_pump_loop` + the close tail it
+  // wants its own witness lines a smoke or shell caller can grep for.
+  //
+  //   pdxsock tcp-server listening ok port=<P>\n
+  //     Emitted immediately after `sys_listen` returns success and
+  //     before `sys_accept` blocks -- confirms the bind + listen wire
+  //     landed and names the port. <P> is the parsed u16 port in
+  //     decimal (1..5 digits; no zero pad).
+  //
+  //   pdxsock tcp-server accept ok fd=<N>\n
+  //     Emitted immediately after `sys_accept` returns success and
+  //     before the pump enters -- confirms a client actually
+  //     connected and names the resulting connection fd. <N> is the
+  //     accepted-fd small integer in decimal.
+  //
+  //   pdxsock tcp-server bytes-in=<N> bytes-out=<M>\n
+  //     Emitted at pump-loop exit, prefix-picked by mode (r14 == 1)
+  //     inside the shared `pdxsock_client_close` tail. Wire format
+  //     matches the client's byte-accounting fingerprint exactly (mid,
+  //     scratches, digit encoder all reused verbatim); only the
+  //     prefix string differs. Server-mode bytes_out is nonzero at
+  //     M2-002+ because the shared pump does sys_send on stdin bytes,
+  //     retiring the v1.1-A "server always writes stdout only" note.
+  //
+  // Both new prefixes are exactly the length of the client's tcp-client
+  // prefix plus 0 (`server` and `client` are both 6 chars); the
+  // `_srv` close prefix is 28 wire bytes to match `pdxsock_msg_close_
+  // prefix` for the same-length reason (the close tail's shared
+  // `mov rdx, 28; syscall` needs no branch).
+  // -----------------------------------------------------------------
+  pub let pdxsock_msg_srv_listen_pre     : [u8; 38] = "pdxsock tcp-server listening ok port=\0"
+  pub let pdxsock_msg_srv_listen_pre_len : u64      = 37
+
+  pub let pdxsock_msg_srv_accept_pre     : [u8; 33] = "pdxsock tcp-server accept ok fd=\0"
+  pub let pdxsock_msg_srv_accept_pre_len : u64      = 32
+
+  pub let pdxsock_msg_close_prefix_srv     : [u8; 29] = "pdxsock tcp-server bytes-in=\0"
+  pub let pdxsock_msg_close_prefix_srv_len : u64      = 28
 
   // -----------------------------------------------------------------
   // v1.1-B semantic-pipe record buffer + supporting state (issue #16).
@@ -1020,10 +1111,25 @@ module Main = structure {
         // ================================================================
 
       pdxsock_client_close:
-        // ---- write(2, "pdxsock tcp-client bytes-in=", 28) ----
+        // ---- write(2, "pdxsock tcp-<mode> bytes-in=", 28) ----
+        //
+        // v1.2-A M2-002 (pdxsock#5): prefix is mode-picked. r14 == 0 =>
+        // "pdxsock tcp-client bytes-in=" (client entry, jumps directly
+        // from pdxsock_pump_loop / pdxsock_pump_stdin_drain during a
+        // client run); r14 == 1 => "pdxsock tcp-server bytes-in="
+        // (server entry, jumps from the same pump loop during a
+        // server run). Both strings are exactly 28 wire bytes so the
+        // shared `mov rdx, 28; syscall` needs no branch on length.
+        // The mid string (" bytes-out="), scratches, digit encoder,
+        // and terminal newline are reused verbatim -- only the
+        // prefix pointer differs by mode.
         mov rdi, 2;                              // fd = stderr
         lea rsi, [rip + pdxsock_msg_close_prefix];
-        mov rdx, 28;                             // pdxsock_msg_close_prefix_len
+        cmp r14, 0;
+        je pdxsock_srv_close_prefix_write;
+        lea rsi, [rip + pdxsock_msg_close_prefix_srv];
+      pdxsock_srv_close_prefix_write:
+        mov rdx, 28;                             // shared client/server _len
         mov rax, 1;
         syscall;
 
@@ -1141,6 +1247,59 @@ module Main = structure {
         //   rbx = port.
         // ================================================================
 
+        // ================================================================
+        // TCP server body -- v1.2-A M2-002 (pdxsock#5).
+        //
+        //   Entry:  rbx = parsed port (0..65535).
+        //   Setup:  sys_socket -> sys_bind(port; INADDR_ANY implicit --
+        //           the kernel bind ABI is `(fd, local_port)` per src/
+        //           kernel/core/syscall/handlers/sys_bind.pdx, and local
+        //           IP is stamped from the interface's _ipv4_my_ip on
+        //           the KIND_TCP_SOCKET arm -- there is no sockaddr
+        //           struct at MVP and no way to bind a different address
+        //           on this kernel's single interface tree).
+        //           sys_listen(fd, backlog=1) -- single-connection-at-a-
+        //           time is the M2-002 scope explicitly, so the honest
+        //           backlog is 1 (also matches the kernel's MVP one-
+        //           slot backlog per sys_listen.pdx header). The kernel
+        //           ignores the value but the honest number surfaces
+        //           what the user tool intends.
+        //           sys_accept(fd) blocks until a client connects; the
+        //           accepted fd replaces the listen fd in r15 for the
+        //           rest of the run.
+        //   Pump:   Jump straight into `pdxsock_pump_loop` (the same
+        //           bidirectional pump the client uses at v1.1-A').
+        //           The pump layout expects the connection fd in r15
+        //           and the byte accumulators in r12/r13 -- both are
+        //           already positioned by the post-accept setup below.
+        //           The pump exits into `pdxsock_client_close` which
+        //           picks the "tcp-server" close-prefix by r14 == 1
+        //           and then falls into the shared semantic-pipe emit
+        //           tail (`pdxsock_emit_session_and_exit`).
+        //
+        //   Fingerprint band on fd 2 (stderr):
+        //     "pdxsock tcp-server listening ok port=<P>\n"  (post-listen)
+        //     "pdxsock tcp-server accept ok fd=<N>\n"       (post-accept)
+        //     "pdxsock tcp-server bytes-in=<N> bytes-out=<M>\n" (close tail)
+        //
+        //   Concurrent-client fan-out is EXPLICITLY out of scope at
+        //   this milestone -- a process-per-connection or event-loop
+        //   design is not warranted before M4 smoke traffic drives the
+        //   requirement. A second connect() attempt while the first is
+        //   still pumping will queue on the kernel's single-slot
+        //   backlog and be accepted only after the current session
+        //   closes (which cannot happen at this pump shape since sys_
+        //   exit(0) fires the moment either side EOFs).
+        //
+        //   Decimal encoding for the two setup fingerprints reuses
+        //   `pdxsock_dec_scratch_in` (u64::MAX = 20 digits, u16 port
+        //   fits in 5 and small fds in 1..2). Safe to reuse because
+        //   each write completes before the next overwrite, and the
+        //   final byte-accounting emit (in `pdxsock_client_close`)
+        //   overwrites again from cursor 19 leftward -- the scratch
+        //   never carries stale bytes past its own emit-slice length.
+        // ================================================================
+
       pdxsock_server_body:
         // ---- sys_socket(AF_INET=2, SOCK_STREAM=1, 0). SC+ ID 87. ----
         mov rdi, 2;
@@ -1153,6 +1312,14 @@ module Main = structure {
         mov r15, rax;                            // r15 = listen fd
 
         // ---- sys_bind(fd, port). SC+ ID 88. ----
+        // Kernel ABI: (fd, local_port). No sockaddr struct at MVP;
+        // local_ip is stamped from the interface's _ipv4_my_ip inside
+        // the handler (KIND_TCP_SOCKET arm). Passing INADDR_ANY (0)
+        // through a hypothetical sockaddr slot is meaningless here --
+        // the "bind INADDR_ANY" intent is what the tool documents,
+        // and the single-interface kernel is what materially delivers
+        // it (the tool cannot bind a different address on this
+        // hardware even if it wanted to).
         mov rdi, r15;
         mov rsi, rbx;                            // port
         mov rax, 88;
@@ -1160,57 +1327,188 @@ module Main = structure {
         cmp rax, 0;
         jl pdxsock_bind_fail;
 
-        // ---- sys_listen(fd, 8). SC+ ID 89. ----
+        // ---- sys_listen(fd, 1). SC+ ID 89. ----
+        // backlog=1 is the M2-002 scope (single-connection-at-a-time)
+        // AND matches the kernel's MVP one-slot backlog per
+        // sys_listen.pdx header ("MVP backlog is exactly one pending
+        // connection per listener"). Passing 8 (the pre-M2-002 stub
+        // value) would have overstated the accept queue.
         mov rdi, r15;
-        mov rsi, 8;                              // backlog
+        mov rsi, 1;                              // backlog
         mov rax, 89;
         syscall;
         cmp rax, 0;
         jl pdxsock_listen_fail;
 
+        // v1.2-A fingerprint: "pdxsock tcp-server listening ok port=<P>\n"
+        //
+        // Emitted BEFORE sys_accept blocks so a caller (smoke harness,
+        // shell) sees "the port is up" without having to wait for a
+        // client to connect. Chain: prefix write, then decimal-port
+        // digits from pdxsock_dec_scratch_in, then newline.
+        mov rdi, 2;                              // fd = stderr
+        lea rsi, [rip + pdxsock_msg_srv_listen_pre];
+        mov rdx, 37;                             // pdxsock_msg_srv_listen_pre_len
+        mov rax, 1;
+        syscall;
+
+        // ---- divide-by-10 loop: rbx (port) -> pdxsock_dec_scratch_in ----
+        //
+        // Right-to-left fill starting at scratch+19. r9 = remaining value,
+        // r11 = cursor. Zero fast-path emits a single '0' digit (a bind
+        // to port 0 would land port 0 in rbx if the kernel ever allowed
+        // it -- defensive; port==0 is currently gated at parse time via
+        // the empty-string reject inside pdxsock_parse_port but port==0
+        // itself is a valid decimal). Loop exit r11 = first-digit ptr;
+        // emitted length = (scratch + 20) - r11.
+        mov r9, rbx;                             // port
+        lea r11, [rip + pdxsock_dec_scratch_in];
+        add r11, 19;                             // cursor at last stash byte
+        cmp r9, 0;
+        jne pdxsock_srv_port_dec_loop;
+          mov al, 0x30;                          // '0'
+          mov [r11], al;
+          mov rdi, 2;
+          mov rsi, r11;
+          mov rdx, 1;
+          mov rax, 1;
+          syscall;
+          jmp pdxsock_srv_port_dec_done;
+
+      pdxsock_srv_port_dec_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;
+        div rcx;                                 // rax = quot, rdx = rem
+        add rdx, 0x30;                           // digit -> ASCII
+        mov [r11], dl;
+        mov r9, rax;
+        cmp r9, 0;
+        je pdxsock_srv_port_dec_emit;
+        sub r11, 1;
+        jmp pdxsock_srv_port_dec_loop;
+
+      pdxsock_srv_port_dec_emit:
+        mov rdi, 2;
+        mov rsi, r11;
+        lea rax, [rip + pdxsock_dec_scratch_in];
+        add rax, 20;
+        sub rax, r11;                            // rax = digit count
+        mov rdx, rax;
+        mov rax, 1;
+        syscall;
+
+      pdxsock_srv_port_dec_done:
+        // ---- write(2, "\n", 1) ----
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_newline];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+
         // ---- sys_accept(fd). SC+ ID 90. Blocks. ----
+        //
+        // Blocking accept per R94.M4-001 (paideia-os #2068) -- the
+        // handler parks the current task as _tcp_accept_waiter and
+        // sched_blocks until the RX path's tcp_wake_accept_if_any
+        // fires on a completed backlog. On resume, tcp_accept_pending
+        // is re-checked and either returns the child TCB idx (fd) or
+        // -EAGAIN (defensive; wake+clear race). Since r15 holds the
+        // KIND_TCP_LISTENER fd (sys_listen retagged it) the resolver
+        // finds it on the LISTENER arm; a plain KIND_TCP_SOCKET here
+        // would refuse -EBADF.
         mov rdi, r15;
         mov rax, 90;
         syscall;
         cmp rax, 0;
         jl pdxsock_accept_fail;
-        mov r15, rax;                            // r15 = accepted fd (listen fd is closed by loop-exit anyway)
+        mov r15, rax;                            // r15 = accepted fd
+
+        // v1.2-A fingerprint: "pdxsock tcp-server accept ok fd=<N>\n"
+        //
+        // Emitted AFTER accept success and BEFORE the pump enters --
+        // confirms a client connected and names the resulting fd.
+        // Decimal encoding of r15 into pdxsock_dec_scratch_in reuses
+        // the same divide-by-10 shape as the port emit above.
+        // Overwriting the scratch is safe: the port emit completed its
+        // syscall before we get here, and the byte-accounting emit at
+        // pdxsock_client_close will overwrite again.
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_srv_accept_pre];
+        mov rdx, 32;                             // pdxsock_msg_srv_accept_pre_len
+        mov rax, 1;
+        syscall;
+
+        mov r9, r15;                             // fd
+        lea r11, [rip + pdxsock_dec_scratch_in];
+        add r11, 19;
+        cmp r9, 0;
+        jne pdxsock_srv_fd_dec_loop;
+          mov al, 0x30;
+          mov [r11], al;
+          mov rdi, 2;
+          mov rsi, r11;
+          mov rdx, 1;
+          mov rax, 1;
+          syscall;
+          jmp pdxsock_srv_fd_dec_done;
+
+      pdxsock_srv_fd_dec_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;
+        div rcx;
+        add rdx, 0x30;
+        mov [r11], dl;
+        mov r9, rax;
+        cmp r9, 0;
+        je pdxsock_srv_fd_dec_emit;
+        sub r11, 1;
+        jmp pdxsock_srv_fd_dec_loop;
+
+      pdxsock_srv_fd_dec_emit:
+        mov rdi, 2;
+        mov rsi, r11;
+        lea rax, [rip + pdxsock_dec_scratch_in];
+        add rax, 20;
+        sub rax, r11;
+        mov rdx, rax;
+        mov rax, 1;
+        syscall;
+
+      pdxsock_srv_fd_dec_done:
+        // ---- write(2, "\n", 1) ----
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_newline];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
 
         // v1.1-B: session accounting starts NOW (post-accept success).
-        // Server mode has no peer_ip / peer_port at v1.1-A (sys_accept
+        // Server mode has no peer_ip / peer_port at M2-002 (sys_accept
         // does not thread an out-address; a future recvfrom / accept
         // out-param wave lands them). rbp = 0 makes the emitted record
         // honest -- consumers can distinguish server records by mode==1
         // + peer_ip==0 without a separate presence flag.
+        //
+        // r13 (bytes_out) is now potentially nonzero at server exit
+        // because the shared pump does sys_send on stdin bytes -- this
+        // retires the v1.1-A "server always writes stdout only" note.
         xor rbp, rbp;                            // peer_ip = 0 (server mode)
         xor r12, r12;                            // bytes_in  = 0
-        xor r13, r13;                            // bytes_out = 0 (server v1.1-A never sys_sends)
+        xor r13, r13;                            // bytes_out = 0
         rdtsc;
         shl rdx, 32;
         or rax, rdx;
         mov [rip + pdxsock_session_start_ns], rax;
 
-      pdxsock_server_recv_loop:
-        // ---- sys_recv(fd, buf, 4096). SC+ ID 93. ----
-        mov rdi, r15;
-        lea rsi, [rip + pdxsock_buf];
-        mov rdx, 4096;
-        mov rax, 93;
-        syscall;
-        cmp rax, 0;
-        jle pdxsock_emit_session_and_exit;
-
-        // v1.1-B: bytes_in += n. Same rationale as the client-side add.
-        add r12, rax;
-
-        // ---- sys_write(1, buf, n). SC+ ID 1. ----
-        mov rdx, rax;
-        mov rdi, 1;
-        lea rsi, [rip + pdxsock_buf];
-        mov rax, 1;
-        syscall;
-
-        jmp pdxsock_server_recv_loop;
+        // v1.2-A: reuse the client-side bidirectional pump verbatim.
+        // Register layout at entry matches what pdxsock_pump_loop
+        // expects: r15 = connection fd, r12 = bytes_in accumulator,
+        // r13 = bytes_out accumulator, r14 = 1 (mode, read by the
+        // close tail's prefix pick). rbp = 0 and rbx = port carry
+        // through to the shared semantic-pipe emit block unchanged.
+        jmp pdxsock_pump_loop;
 
         // ================================================================
         // v1.1-B shared tail: emit SockSessionRecord@0.1 via sys_semantic_send

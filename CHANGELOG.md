@@ -18,6 +18,77 @@ Version discipline:
 ## [Unreleased]
 
 ### Changed
+- **TCP server: bind+listen+accept + shared bidirectional pump
+  (pdxsock#5, M2-002).** Retires v1.1-A's recv-only server tail
+  (`sys_recv` -> `sys_write` -> break) with the shared
+  bidirectional pump the client body gained at v1.1-A'. Setup
+  sequence: `sys_socket` -> `sys_bind(fd, port)` (INADDR_ANY
+  implicit; the kernel bind ABI is `(fd, local_port)` and the
+  local IP is stamped from the interface's `_ipv4_my_ip` on the
+  KIND_TCP_SOCKET arm -- the tool documents "INADDR_ANY" and the
+  single-interface kernel is what materially delivers it) ->
+  `sys_listen(fd, backlog=1)` (single-connection-at-a-time is the
+  M2-002 scope, and 1 also matches the kernel's MVP one-slot
+  backlog per `sys_listen.pdx` header -- the pre-M2-002 stub value
+  of 8 overstated the accept queue) -> `sys_accept(fd)` (blocking
+  per R94.M4-001 waiter table). On accept success the server jumps
+  directly into `pdxsock_pump_loop` with r15 = accepted fd, r12/
+  r13 zeroed, r14 = 1 (mode), rbp = 0 (no peer_ip threaded through
+  sys_accept at MVP). Pump exits into `pdxsock_client_close` whose
+  prefix write is now mode-picked (r14 branch picks the "tcp-
+  client" or "tcp-server" prefix; both are exactly 28 wire bytes
+  so the shared `mov rdx, 28; syscall` needs no branch on length).
+  Server-mode `bytes_out` is now potentially nonzero -- retires
+  the v1.1-B "server always 0" `SockSessionRecord@0.1` note.
+  Concurrent-client fan-out is EXPLICITLY out of scope at M2-002:
+  a process-per-connection or event-loop design is not warranted
+  before M4 smoke traffic drives the requirement, and the kernel's
+  single-slot backlog is the honest cap.
+
+  Closes #5.
+
+### Added
+- **TCP server fingerprint band (pdxsock#5, M2-002).** Three
+  grep-searchable status lines on fd 2 (stderr, NOT stdout --
+  stdout is reserved for socket payload just as in the client
+  path) that frame every TCP server run:
+
+  1. `pdxsock tcp-server listening ok port=<P>\n` -- emitted
+     immediately after `sys_listen` returns success and BEFORE
+     `sys_accept` blocks. Confirms the bind + listen wire landed
+     and names the port a smoke or shell caller should connect
+     to. `<P>` is the parsed u16 port in decimal (1..5 digits;
+     no zero pad).
+  2. `pdxsock tcp-server accept ok fd=<N>\n` -- emitted
+     immediately after `sys_accept` returns success and BEFORE
+     the pump enters. Confirms a client actually connected and
+     names the resulting connection fd. `<N>` is the accepted-
+     fd small integer in decimal.
+  3. `pdxsock tcp-server bytes-in=<N> bytes-out=<M>\n` --
+     emitted at pump-loop exit (either side EOFs or errors),
+     prefix-picked by mode inside the shared
+     `pdxsock_client_close` tail. Wire format matches the
+     client's byte-accounting fingerprint exactly (mid,
+     scratches, digit encoder all reused verbatim).
+
+  Added `.rodata` message constants:
+  `pdxsock_msg_srv_listen_pre` (37 wire bytes),
+  `pdxsock_msg_srv_accept_pre` (32 wire bytes),
+  `pdxsock_msg_close_prefix_srv` (28 wire bytes -- same length
+  as `pdxsock_msg_close_prefix` for a shared write count).
+  Reuses `pdxsock_msg_newline` for terminal `\n` and
+  `pdxsock_dec_scratch_in` for both decimal encodings (each
+  emit completes before the next overwrite; safe reuse).
+
+  New labels under `_start`: `pdxsock_srv_port_dec_loop`,
+  `pdxsock_srv_port_dec_emit`, `pdxsock_srv_port_dec_done`,
+  `pdxsock_srv_fd_dec_loop`, `pdxsock_srv_fd_dec_emit`,
+  `pdxsock_srv_fd_dec_done`, `pdxsock_srv_close_prefix_write`.
+  The old `pdxsock_server_recv_loop` label is retired (its
+  recv+write shape is subsumed by the shared pump loop). All
+  new labels carry the `pdxsock_srv_` prefix per reserved-label
+  discipline.
+
 - **TCP client: real bidirectional pump + close-fingerprint band
   (pdxsock#4, M2-001).** Retires v1.1-A's HTTP-style client shape
   (one 4 KiB `sys_read(0, …)`, one `sys_send`, then a
