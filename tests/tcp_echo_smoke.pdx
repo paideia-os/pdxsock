@@ -1,0 +1,443 @@
+// tests/tcp_echo_smoke.pdx -- pdxsock M4-001 TCP echo round-trip smoke (pdxsock#9).
+//
+// Wave: R100  Milestone: M4-001 (pdxsock#9)
+// Doc:  design/networking/r100-user-tools-plan.md §13.6 (paideia-os)
+//
+// Purpose ---------------------------------------------------------------
+// Boot-smoke witness that exercises the pdxsock v1.1-A' TCP client body
+// (from pdxsock#4) round-tripping against a TCP server that echoes bytes
+// verbatim. Sends a fixed 32-byte payload, verifies the exact echo comes
+// back byte-for-byte, and emits a grep-friendly fingerprint line on fd 2.
+//
+// Fixture-harness approach ---------------------------------------------
+// pdxsock has no in-tree fork/spawn scaffolding to bring up a server
+// process from within a smoke ELF (no `sys_fork` / `sys_execve` on the
+// user surface, and the tests directory build.sh rule only produces
+// `.o` objects -- not linked executables). Furthermore, the pdxsock
+// server body (src/main.pdx `pdxsock_server_body` + shared
+// `pdxsock_pump_loop`) is a stdin<->socket / socket<->stdout relay, NOT
+// a socket<->socket echo -- pumping received socket bytes back to the
+// same socket needs stdout piped into stdin, which no shell can do
+// natively.
+//
+// So this witness follows the task-charter alternate scaffold: a
+// SINGLE dual-role ELF that, driven by `argv[1]`, is either an echo
+// server (`server`: bind+listen+accept, then recv-loop-until-32-bytes
+// and send-them-back-verbatim, then shutdown+exit) or the round-trip
+// client (`client`: connect 127.0.0.1:5555, send the 32-byte payload,
+// recv-loop-until-32-bytes, byte-compare payload vs. received, emit
+// fingerprint, shutdown+exit).
+//
+// The two-invocation harness that runs `tcp_echo_smoke server` in one
+// task and `tcp_echo_smoke client` in another sequentially (start
+// server, wait for the accept-blocking spin-up, launch client, wait
+// for both to exit, diff the client's fd-2 fingerprint against the
+// golden) lands in the paideia-os monorepo smoke wiring -- filed as
+// a follow-up (paideia-os smoke-runner extension for two-invocation
+// TCP round-trip witnesses). Under the current tools/build.sh regime
+// this file compiles to `build-out/tests-tcp_echo_smoke.o` and gates
+// only the encoder patterns (paideia-as 0.36+ pitfalls per user
+// memory `pdx encoder pitfalls`): the runtime round-trip proof-of-
+// life awaits the paideia-os harness landing.
+//
+// Payload ---------------------------------------------------------------
+// Fixed 32-byte deterministic ASCII pattern:
+//   "abcdefghijklmnopqrstuvwxyz012345"
+// Choice rationale: 32 bytes fits in one loopback MTU with room to
+// spare so a healthy kernel resolves the send/recv in a single chunk
+// (the loops below tolerate fragmentation defensively). Printable
+// ASCII makes hex-dump diagnosis on a mismatch trivial (`grep -a`
+// friendly), and mixing letters+digits ensures no accidental "all
+// zero" false-positive if a bug leaves recv_buf uninitialised (the
+// .bss buffer is zero on the first run, so a broken echo that yields
+// all-zeros would not accidentally match a zero-only payload).
+//
+// Fingerprint format ----------------------------------------------------
+// On match (client mode):   "pdxsock tcp-echo ok bytes=32\n"   (29 bytes)
+// On mismatch (client mode): "pdxsock tcp-echo FAIL\n"          (22 bytes)
+// On any setup-syscall failure (either mode): the shared
+// "pdxsock tcp-echo setup fail\n" (28 bytes) diagnostic on fd 2,
+// then exit 5. This collapses the socket / bind / listen / accept /
+// connect / send / recv failure surfaces into one message rather
+// than the six distinct exits pdxsock main.pdx carries -- the smoke
+// is a pass/fail witness, not a diagnostic tool. A future landing
+// may split these to match main.pdx's exit-code taxonomy (4=socket,
+// 5=bind/connect, 6=listen, 7=accept) once the harness cares about
+// them.
+//
+// Exit codes:
+//   0 = client-mode success (echo matched) OR server-mode success
+//       (bytes echoed back)
+//   1 = client-mode echo mismatch (FAIL fingerprint emitted)
+//   2 = argv usage refusal (`tcp_echo_smoke` with no or wrong argv[1])
+//   5 = any setup-syscall failure (socket / bind / listen / accept /
+//       connect / send / recv), either mode
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls, per user memory) --------
+//   * No `test rN, rN` -- every zero-check is `cmp rN, 0` (matches
+//     src/main.pdx precedent). Non-zero checks likewise use `cmp`.
+//   * No 2-op `imul r, imm` -- no *10 fold in this witness (port and
+//     IP are hardcoded immediates; no decimal parse loop).
+//   * No `and r11, imm64` on r8..r15 -- no bit-mask operations.
+//   * Byte loads via `xor rN, rN; mov_b rN, [ptr]` (paideia-as #1248:
+//     REX.W cmp on rN needs the upper bits pre-zeroed for a clean
+//     byte compare).
+//   * PascalCase module basename (`TcpEchoSmoke` from
+//     `tcp_echo_smoke.pdx`).
+//   * Every label prefixed `tes_` (reserved-word discipline: `loop`,
+//     `if` etc. are keywords and bare labels using them fail to
+//     parse -- `tes_srv_recv_loop` etc. have `loop` only as a suffix,
+//     which is fine).
+//   * SysV alignment: leaf syscall-only body, no `call` cross-module,
+//     no push/pop -- rsp % 16 == 0 posture inherited from ELF process
+//     init and preserved throughout.
+//   * Immediates: `0x7F000001` (127.0.0.1 packed per sys_connect's
+//     `bits [31:24]=a, [23:16]=b, [15:8]=c, [7:0]=d` convention),
+//     `5555` (port), `32` (payload len) are all imm32-safe (fit in
+//     31 bits).
+//   * String literals: single-line, trailing NUL declared in the
+//     array size (`[u8; N+1]`) with a sibling `_len` constant carrying
+//     the wire byte count (no NUL). Mismatches silently corrupt
+//     adjacent .rodata per user memory `pdx encoder pitfalls`
+//     (fingerprint tag size off-by-one).
+//
+// SC+ IDs used (matches src/user/syscall_shim.pdx + design/user/
+// syscall-table.md through sysno 94):
+//   0   = sys_read      (fd, buf, count)         -> n | -errno   (unused)
+//   1   = sys_write     (fd, buf, count)         -> n | -errno
+//   60  = sys_exit      (status)                 -> never returns
+//   87  = sys_socket    (domain, type, proto)    -> fd | -errno
+//   88  = sys_bind      (fd, local_port)         -> 0 | -errno
+//   89  = sys_listen    (fd, backlog)            -> 0 | -errno
+//   90  = sys_accept    (fd)                     -> new fd | -errno
+//   91  = sys_connect   (fd, remote_ip, port)    -> 0 | -errno
+//   92  = sys_send      (fd, buf, len)           -> n | -errno
+//   93  = sys_recv      (fd, buf, len)           -> n | -errno
+//   94  = sys_shutdown  (fd, how)                -> 0 | -errno
+
+module TcpEchoSmoke = structure {
+
+  // -------------------------------------------------------------------
+  // 32-byte fixed payload (.rodata). Deterministic ASCII pattern so a
+  // mismatch diagnostic is trivially readable in a hex dump. Sibling
+  // `_len` names the wire byte count (excludes trailing NUL).
+  // -------------------------------------------------------------------
+  pub let tes_payload      : [u8; 33] = "abcdefghijklmnopqrstuvwxyz012345\0"
+  pub let tes_payload_len  : u64 = 32
+
+  // -------------------------------------------------------------------
+  // 32-byte receive buffer (.bss, @align(8)). Overwritten on every
+  // recv-loop iteration; initial contents (zero from .bss) never
+  // observed post-fill.
+  // -------------------------------------------------------------------
+  pub let mut tes_recv_buf : [u8; 32] = uninit @align(8)
+
+  // -------------------------------------------------------------------
+  // Diagnostic + fingerprint strings. Every literal is one line; the
+  // `_len` sibling is the wire byte count (excludes trailing NUL).
+  // -------------------------------------------------------------------
+  pub let tes_msg_usage      : [u8; 22] = "usage: server|client\n\0"
+  pub let tes_msg_usage_len  : u64 = 21
+
+  pub let tes_msg_ok         : [u8; 30] = "pdxsock tcp-echo ok bytes=32\n\0"
+  pub let tes_msg_ok_len     : u64 = 29
+
+  pub let tes_msg_fail       : [u8; 23] = "pdxsock tcp-echo FAIL\n\0"
+  pub let tes_msg_fail_len   : u64 = 22
+
+  pub let tes_msg_setup      : [u8; 29] = "pdxsock tcp-echo setup fail\n\0"
+  pub let tes_msg_setup_len  : u64 = 28
+
+  // -------------------------------------------------------------------
+  // _start -- witness entry point. argv[1] picks role.
+  //
+  // Register plan (all callee-save, so they survive every syscall
+  // without push/pop -- SYSCALL preserves callee-save regs by the
+  // amd64 fast-syscall convention):
+  //   r12 = bytes-received accumulator (recv-loop)
+  //   r13 = argv base (Step 0..argv dispatch; unused thereafter)
+  //   r14 = bytes-sent accumulator (send-loop) / byte-compare cursor
+  //   r15 = fd (from sys_socket / sys_accept)
+  //   rbx = argv[1] first-byte scratch during dispatch
+  //
+  // Exit statuses:
+  //   0 = success (client match OR server done)
+  //   1 = client-mode echo mismatch
+  //   2 = argv usage refusal
+  //   5 = setup-syscall failure (socket / bind / listen / accept /
+  //       connect / send / recv)
+  //
+  // Effects: {mem, sysreg} for scratch touches + every SYSCALL.
+  // Caps:    @{fs, sched, cap} -- fs for read/write, sched for exit,
+  //          cap for the socket-syscall family (all cap-gated on the
+  //          kernel side per src/kernel/core/syscall/handlers/
+  //          sys_socket.pdx et al).
+  // -------------------------------------------------------------------
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched, cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched, cap},
+      justification: "pdxsock.M4-001 (pdxsock#9) TCP echo round-trip smoke witness. Single dual-role ELF that, driven by argv[1] first byte ('s' -> server, 'c' -> client), is either an echo server (bind+listen+accept on 127.0.0.1:5555, then recv-loop-until-32-bytes and send-them-back-verbatim, then shutdown+exit) or the round-trip client (connect 127.0.0.1:5555, send fixed 32-byte payload, recv-loop-until-32-bytes, byte-compare, emit `pdxsock tcp-echo ok bytes=32\\n` on match or `pdxsock tcp-echo FAIL\\n` on mismatch, shutdown+exit). Selected argv dispatch over separate ELFs so a single compile-audit gates both halves of the round-trip against the same encoder discipline; the two-invocation harness that sequences server then client lands in paideia-os monorepo smoke wiring as a follow-up. Payload is 32 bytes of `abcdefghijklmnopqrstuvwxyz012345` -- deterministic ASCII so a mismatch is hex-dump readable, size fits in a single loopback MTU (the send/recv loops tolerate fragmentation defensively). Fixture-harness rationale (see file header): pdxsock has no in-tree fork/spawn scaffolding, and pdxsock main.pdx's server body is a stdin<->socket / socket<->stdout relay (netcat-shaped) not a socket<->socket echo -- so a bare `pdxsock -l 5555` fixture cannot loopback bytes back to the client without external plumbing. Under current tools/build.sh regime, tests/*.pdx compiles to build-out/tests-<name>.o but is NOT linked -- runtime round-trip proof-of-life awaits the paideia-os harness landing. Register plan: r12=bytes-recv accum, r13=argv base (dispatch only), r14=bytes-sent accum / cmp cursor, r15=fd, rbx=argv[1] byte scratch during dispatch. Exit codes: 0=success, 1=mismatch, 2=usage refusal, 5=any setup syscall failure (collapsed rather than main.pdx's 4/5/6/7 taxonomy -- smoke is pass/fail, not diagnostic). Encoder discipline (per user memory `pdx encoder pitfalls`): no `test rN, rN` (every zero-check is `cmp rN, 0`); no 2-op `imul r, imm` (no *10 fold in this witness -- port and IP are hardcoded); byte loads use `xor rN, rN; mov_b rN, [ptr]`; module name matches file basename PascalCase (TcpEchoSmoke); every label prefixed `tes_` (reserved-word discipline: `loop` etc. are keywords, `tes_srv_recv_loop` etc. have `loop` only as a suffix which is fine). Immediates 0x7F000001 (127.0.0.1 packed per sys_connect abi bits [31:24]=a..[7:0]=d), 5555 (port), 32 (payload len) all fit in imm32. SysV alignment: leaf syscall-only body, no `call` cross-module, no push/pop -- rsp % 16 == 0 posture inherited from ELF process init. No `and reg, imm64` on r8..r15 anywhere. Send and recv loops honestly re-issue on partial completion (`add rsi, r14/r12; mov rdx, 32; sub rdx, r14/r12`) rather than assuming single-chunk delivery -- correct on loopback where a single chunk is expected, correct also on any fragmentation the kernel might introduce. Every failure path emits its diagnostic to fd 2 (stderr) before sys_exit, mirroring pdxsock main.pdx's diagnostic-vs-payload split (fd 1 is reserved for socket payload; a status line interleaved there would corrupt downstream consumers).",
+      block: {
+        // ---- Step 0: latch argc / argv from execve-ABI registers. ----
+        mov r12, rdi;                           // r12 = argc (temp)
+        mov r13, rsi;                           // r13 = argv
+
+        // ---- Step 1: argc gate. argc must be exactly 2. ----
+        cmp r12, 2;
+        jne tes_usage;
+
+        // ---- Step 2: argv[1] first byte picks role. ----
+        // 's' (0x73) -> server; 'c' (0x63) -> client; anything else -> usage.
+        mov rbx, [r13 + 8];                     // rbx = argv[1]
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0x73;                          // 's'
+        je tes_server_body;
+        cmp rax, 0x63;                          // 'c'
+        je tes_client_body;
+        jmp tes_usage;
+
+        // ================================================================
+        // Diagnostic exits
+        // ================================================================
+
+      tes_usage:
+        mov rdi, 2;                             // fd = stderr
+        lea rsi, [rip + tes_msg_usage];
+        mov rdx, 21;                            // tes_msg_usage_len
+        mov rax, 1;                             // sys_write
+        syscall;
+        mov rdi, 2;                             // exit status = 2 (usage)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      tes_setup_fail:
+        mov rdi, 2;
+        lea rsi, [rip + tes_msg_setup];
+        mov rdx, 28;                            // tes_msg_setup_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 5;                             // exit status = 5 (setup)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ================================================================
+        // Server body -- socket / bind(5555) / listen(1) / accept /
+        // recv-loop-until-32 / send-loop-until-32 / shutdown / exit(0).
+        //
+        // Bind ABI: (fd, local_port). No sockaddr at MVP; local IP
+        // stamped from the interface's _ipv4_my_ip on KIND_TCP_SOCKET
+        // per src/kernel/core/syscall/handlers/sys_bind.pdx.
+        //
+        // Backlog=1 matches main.pdx's server-mode choice (the
+        // kernel's single-slot backlog cap per sys_listen.pdx). The
+        // smoke expects exactly one client, so 1 is the honest number.
+        // ================================================================
+
+      tes_server_body:
+        // ---- sys_socket(AF_INET=2, SOCK_STREAM=1, 0). SC+ ID 87. ----
+        mov rdi, 2;                             // AF_INET
+        mov rsi, 1;                             // SOCK_STREAM
+        xor rdx, rdx;                           // proto = 0
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl tes_setup_fail;
+        mov r15, rax;                           // r15 = listen fd
+
+        // ---- sys_bind(fd, 5555). SC+ ID 88. ----
+        mov rdi, r15;
+        mov rsi, 5555;                          // local_port
+        mov rax, 88;
+        syscall;
+        cmp rax, 0;
+        jl tes_setup_fail;
+
+        // ---- sys_listen(fd, 1). SC+ ID 89. ----
+        mov rdi, r15;
+        mov rsi, 1;                             // backlog = 1 (single client)
+        mov rax, 89;
+        syscall;
+        cmp rax, 0;
+        jl tes_setup_fail;
+
+        // ---- sys_accept(fd). SC+ ID 90. Blocks. ----
+        mov rdi, r15;
+        mov rax, 90;
+        syscall;
+        cmp rax, 0;
+        jl tes_setup_fail;
+        mov r15, rax;                           // r15 = accepted (connection) fd
+
+        // ---- Recv-loop-until-32 into tes_recv_buf. ----
+        // r12 = bytes accumulated; loop reads (32 - r12) at [buf + r12].
+        // Any recv <= 0 during the fill is a setup failure (peer
+        // disappeared before delivering the full payload -- smoke
+        // pass/fail collapse per the file header).
+        xor r12, r12;
+      tes_srv_recv_loop:
+        mov rdi, r15;
+        lea rsi, [rip + tes_recv_buf];
+        add rsi, r12;
+        mov rdx, 32;
+        sub rdx, r12;
+        mov rax, 93;                            // sys_recv
+        syscall;
+        cmp rax, 0;
+        jle tes_setup_fail;
+        add r12, rax;
+        cmp r12, 32;
+        jl tes_srv_recv_loop;
+
+        // ---- Send-loop-until-32 from tes_recv_buf. ----
+        // r14 = bytes sent; loop sends (32 - r14) at [buf + r14].
+        xor r14, r14;
+      tes_srv_send_loop:
+        mov rdi, r15;
+        lea rsi, [rip + tes_recv_buf];
+        add rsi, r14;
+        mov rdx, 32;
+        sub rdx, r14;
+        mov rax, 92;                            // sys_send
+        syscall;
+        cmp rax, 0;
+        jle tes_setup_fail;
+        add r14, rax;
+        cmp r14, 32;
+        jl tes_srv_send_loop;
+
+        // ---- sys_shutdown(fd, SHUT_RDWR=2). SC+ ID 94. ----
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+
+        // ---- sys_exit(0). SC+ ID 60. ----
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ================================================================
+        // Client body -- socket / connect(127.0.0.1:5555) / send-loop /
+        // recv-loop / byte-compare / fingerprint / shutdown / exit.
+        //
+        // sys_connect ABI: (fd, remote_ip_u32, port_u64). remote_ip
+        // byte order: bits [31:24]=a, [23:16]=b, [15:8]=c, [7:0]=d
+        // for "a.b.c.d" -- 127.0.0.1 packs as 0x7F000001. Ground
+        // truth: src/kernel/core/syscall/handlers/sys_connect.pdx.
+        // ================================================================
+
+      tes_client_body:
+        // ---- sys_socket(AF_INET=2, SOCK_STREAM=1, 0). SC+ ID 87. ----
+        mov rdi, 2;
+        mov rsi, 1;
+        xor rdx, rdx;
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl tes_setup_fail;
+        mov r15, rax;                           // r15 = fd
+
+        // ---- sys_connect(fd, 0x7F000001, 5555). SC+ ID 91. ----
+        mov rdi, r15;
+        mov rsi, 0x7F000001;                    // 127.0.0.1
+        mov rdx, 5555;                          // remote_port
+        mov rax, 91;
+        syscall;
+        cmp rax, 0;
+        jl tes_setup_fail;
+
+        // ---- Send-loop-until-32 from tes_payload. ----
+        xor r14, r14;
+      tes_cli_send_loop:
+        mov rdi, r15;
+        lea rsi, [rip + tes_payload];
+        add rsi, r14;
+        mov rdx, 32;
+        sub rdx, r14;
+        mov rax, 92;                            // sys_send
+        syscall;
+        cmp rax, 0;
+        jle tes_setup_fail;
+        add r14, rax;
+        cmp r14, 32;
+        jl tes_cli_send_loop;
+
+        // ---- Recv-loop-until-32 into tes_recv_buf. ----
+        xor r12, r12;
+      tes_cli_recv_loop:
+        mov rdi, r15;
+        lea rsi, [rip + tes_recv_buf];
+        add rsi, r12;
+        mov rdx, 32;
+        sub rdx, r12;
+        mov rax, 93;                            // sys_recv
+        syscall;
+        cmp rax, 0;
+        jle tes_setup_fail;
+        add r12, rax;
+        cmp r12, 32;
+        jl tes_cli_recv_loop;
+
+        // ---- Byte-compare payload vs. received (32 bytes). ----
+        // rcx = index cursor. Load each side into rax (payload) and r8
+        // (recv_buf) via xor-then-mov_b for a clean byte compare (per
+        // paideia-as #1248: cmp with REX.W needs upper bits zeroed).
+        // A mismatch jumps to tes_cli_fail; a full 32-byte match falls
+        // through to tes_cli_ok.
+        xor rcx, rcx;
+      tes_cli_cmp_loop:
+        xor rax, rax;
+        lea r10, [rip + tes_payload];
+        mov_b rax, [r10 + rcx*1];
+        xor r8, r8;
+        lea r10, [rip + tes_recv_buf];
+        mov_b r8, [r10 + rcx*1];
+        cmp rax, r8;
+        jne tes_cli_fail;
+        add rcx, 1;
+        cmp rcx, 32;
+        jl tes_cli_cmp_loop;
+
+        // ---- Match: emit "pdxsock tcp-echo ok bytes=32\n" on fd 2. ----
+        mov rdi, 2;
+        lea rsi, [rip + tes_msg_ok];
+        mov rdx, 29;                            // tes_msg_ok_len
+        mov rax, 1;
+        syscall;
+        // ---- sys_shutdown(fd, SHUT_RDWR=2). SC+ ID 94. ----
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+        // ---- sys_exit(0). ----
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      tes_cli_fail:
+        // ---- Mismatch: emit "pdxsock tcp-echo FAIL\n" on fd 2. ----
+        mov rdi, 2;
+        lea rsi, [rip + tes_msg_fail];
+        mov rdx, 22;                            // tes_msg_fail_len
+        mov rax, 1;
+        syscall;
+        // ---- sys_shutdown(fd, SHUT_RDWR=2). ----
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+        // ---- sys_exit(1). ----
+        mov rdi, 1;
+        mov rax, 60;
+        syscall;
+        hlt;
+      }
+    }
+
+}

@@ -18,6 +18,76 @@ Version discipline:
 ## [Unreleased]
 
 ### Added
+- **TCP echo round-trip smoke witness (pdxsock#9, M4-001).** Adds
+  `tests/tcp_echo_smoke.pdx` (module `TcpEchoSmoke`, single
+  `_start` `pub let` entry point) as a dual-role ELF that, driven
+  by `argv[1]` first byte, is either the echo server (`server`:
+  `sys_socket` + `sys_bind(5555)` + `sys_listen(1)` + `sys_accept`,
+  then a recv-loop-until-32-bytes into `tes_recv_buf` followed by
+  a send-loop-until-32-bytes back to the peer, then `sys_shutdown`
+  + `sys_exit(0)`) or the round-trip client (`client`:
+  `sys_socket` + `sys_connect(0x7F000001, 5555)`, then a send-
+  loop-until-32-bytes from `tes_payload` and a recv-loop-until-32-
+  bytes into `tes_recv_buf`, then a 32-byte inline byte-compare,
+  then the fingerprint emit and `sys_shutdown` + `sys_exit`).
+
+  Fixed 32-byte payload:
+  `"abcdefghijklmnopqrstuvwxyz012345"` -- deterministic printable
+  ASCII so a mismatch is hex-dump readable and no accidental
+  all-zero false-positive can match a `.bss`-fresh `tes_recv_buf`
+  (26 letters + 6 digits guarantees a byte in every position).
+
+  Fingerprint on match (client mode, fd 2):
+  `pdxsock tcp-echo ok bytes=32\n` (29 wire bytes). On mismatch:
+  `pdxsock tcp-echo FAIL\n` (22 wire bytes). On any setup-syscall
+  failure (either mode): the shared `pdxsock tcp-echo setup fail\n`
+  (28 wire bytes) diagnostic on fd 2 followed by `sys_exit(5)`.
+  Exit-code taxonomy is intentionally coarser than main.pdx's
+  (`0`=success / `1`=echo mismatch / `2`=usage refusal /
+  `5`=any setup syscall failure) -- the smoke is pass/fail, not
+  diagnostic; a future landing may split `5` into main.pdx's
+  4/5/6/7 (socket / connect / bind / listen / accept) codes once
+  the harness cares about them.
+
+  Fixture-harness approach: pdxsock has no in-tree fork/spawn
+  scaffolding to bring up a server process from within a smoke
+  ELF (no `sys_fork` / `sys_execve` on the user surface, and
+  `tools/build.sh` under the `tests/*.pdx` glob emits `.o`
+  objects only -- not linked executables). Furthermore, pdxsock
+  main.pdx's `pdxsock_server_body` + shared `pdxsock_pump_loop`
+  is a stdin<->socket / socket<->stdout relay, NOT a
+  socket<->socket echo -- pumping received socket bytes back to
+  the same socket needs stdout piped into stdin, which no shell
+  can do natively. So this witness follows the task-charter
+  alternate scaffold: a SINGLE dual-role ELF, argv-picked, that
+  compiles today and awaits the paideia-os monorepo smoke wiring
+  to sequence the two invocations (start server, wait for the
+  accept-blocking spin-up, launch client, diff the client's fd-2
+  fingerprint against the golden). The paideia-os smoke-runner
+  extension that runs this pair is filed as a follow-up (M4-001
+  runtime harness landing).
+
+  Runnability today: the witness COMPILES today under
+  `bash tools/build.sh` (which extends the source-glob build over
+  `tests/*.pdx` and emits `build-out/tests-tcp_echo_smoke.o`),
+  gating the encoder-discipline patterns paideia-as 0.36+
+  requires (per user memory `pdx encoder pitfalls`: no
+  `test rN, rN`, no 2-op `imul r, imm`, byte loads via
+  `xor rN, rN; mov_b rN, [ptr]`, PascalCase basename, `tes_`
+  label prefix for reserved-word discipline, SysV alignment).
+  Runtime round-trip proof-of-life awaits the paideia-os harness
+  landing above; no `manifest.pdxproj` `tests:` list edit at
+  this landing (the `.o`-only compile is unchanged from the
+  build-script convention `tools/build.sh` already established).
+
+  Added `.rodata` message constants: `tes_payload` (32-byte
+  fixed pattern), `tes_msg_usage` (21 bytes), `tes_msg_ok` (29
+  bytes), `tes_msg_fail` (22 bytes), `tes_msg_setup` (28 bytes)
+  each with a sibling `_len` u64 constant carrying the wire byte
+  count. One `.bss` slot: `tes_recv_buf : [u8; 32] @align(8)`.
+
+  Closes #9.
+
 - **`libpdx-audit` integration wire STUB (pdxsock#7, M3-002).** Adds
   `src/audit_wire.pdx` (module `AuditWire`, two `pub let` entry
   points: `pdxsock_audit_session_start(peer_ip, peer_port, mode)`
