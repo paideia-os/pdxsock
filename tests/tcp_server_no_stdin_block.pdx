@@ -1,0 +1,381 @@
+// tests/tcp_server_no_stdin_block.pdx -- pdxsock v1.2.1 hotfix
+// witness for pdxsock#20 (TCP server idle-stdin block).
+//
+// Wave: R100  Milestone: v1.2.1 hotfix (pdxsock#20)
+// Doc:  CHANGELOG.md `[1.2.1]` stanza; issue paideia-os/pdxsock#20
+//
+// Purpose ---------------------------------------------------------------
+// Compile-gated witness proving the shape of a TCP server surface that
+// never touches sys_read(fd=0). Complements the runtime fix in
+// src/main.pdx (pdxsock_pump_loop Step-0 mode gate) by demonstrating
+// the same "recv-only server pump" shape stands on its own as a
+// standalone ELF and gates the encoder-discipline patterns paideia-as
+// 0.36+ requires (no `test rN,rN`, no 2-op `imul r,imm`, `tsnsb_`
+// label prefix, PascalCase module basename, byte-load zero-then-mov_b,
+// SysV alignment).
+//
+// A one-line grep proves the surface is stdin-free by construction:
+//   grep -F 'mov rax, 0;' tests/tcp_server_no_stdin_block.pdx
+// yields no hit (this file uses sysno immediates 1, 60, 87, 88, 89,
+// 90, 92, 93, 94 exclusively). Any regression that reintroduces a
+// stdin sys_read into a server-side entry surface trips this grep.
+//
+// Fixture-harness approach ---------------------------------------------
+// Same pattern as tests/tcp_echo_smoke.pdx: pdxsock has no in-tree
+// fork/spawn scaffolding, and the tests/*.pdx build.sh rule emits
+// `.o` objects only (not linked executables). This witness therefore
+// COMPILES today under `bash tools/build.sh` (gating the encoder
+// discipline for a stdin-free server body) and awaits the paideia-os
+// smoke-runner extension that sequences a client against a server-
+// binary invocation. Runtime proof-of-life under that harness:
+//   1. Harness spawns this witness as `tcp_server_no_stdin_block
+//      5555` in a task with the smoke's INJECT_HOLD budget.
+//   2. Witness reaches "pdxsock server witness listening ok\n" on
+//      fd 2 immediately (no stdin path in the pre-accept chain).
+//   3. Harness spawns a companion client that connects
+//      127.0.0.1:5555 and sends one byte.
+//   4. Witness's sys_accept returns; emits "pdxsock server witness
+//      accept ok\n" on fd 2, then sys_recv drains the one byte,
+//      sys_write echoes it to stdout, emits "pdxsock server witness
+//      recv ok bytes=1\n" on fd 2, shuts down, sys_exit(0).
+//   5. Harness diffs the three-line fingerprint band against the
+//      golden; a pre-#20 pdxsock main.pdx build reached "accept ok"
+//      and then hung indefinitely on sys_read(0) inside the shared
+//      pump -- this witness reaches "recv ok" in one round trip.
+//
+// Payload ---------------------------------------------------------------
+// No fixed payload: the witness's job is to prove the accept + recv +
+// write path is stdin-free, not to round-trip a specific pattern.
+// The recv buffer is 4096 bytes (one page, matches sys_recv's natural
+// transfer sweet spot). One recv iteration; whatever the client sends
+// is echoed to stdout once and the witness exits.
+//
+// Fingerprint band on fd 2 (stderr):
+//   "pdxsock server witness listening ok\n"     (36 wire bytes)
+//   "pdxsock server witness accept ok\n"        (33 wire bytes)
+//   "pdxsock server witness recv ok bytes=<N>\n" (38 + N-digits wire;
+//                                                 37-byte prefix +
+//                                                 N-digits + '\n').
+//
+// Exit codes:
+//   0 = success (accept + recv + write completed)
+//   2 = argv usage refusal (`tcp_server_no_stdin_block` with no
+//       argv[1] port)
+//   5 = any setup-syscall failure (socket / bind / listen / accept /
+//       recv), collapsed for pass/fail witness convention -- same
+//       coarser taxonomy as tests/tcp_echo_smoke.pdx.
+//   8 = bad port (non-digit or > 65535)
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls, per user memory) --------
+//   * No `test rN, rN` -- every zero-check is `cmp rN, 0`.
+//   * No 2-op `imul r, imm` -- decimal *10 in the port parser uses
+//     shl+add+add (rax*8 + rax + rax = rax*10).
+//   * No `and reg, imm64` on r8..r15 -- no bit-mask ops in this file.
+//   * Byte loads via `xor rN, rN; mov_b rN, [ptr]` (paideia-as #1248).
+//   * PascalCase module basename (`TcpServerNoStdinBlock`).
+//   * Every label prefixed `tsnsb_` (reserved-word discipline).
+//   * SysV alignment: leaf syscall-only body, no `call` cross-module,
+//     no push/pop -- rsp % 16 == 0 posture inherited from ELF init.
+//   * Immediates: `4096`, `5555`, small fd/backlog integers all fit
+//     imm32.
+//   * String literals: single-line, trailing NUL in the [u8; N+1]
+//     size, sibling `_len` u64 with the wire byte count (no NUL).
+//
+// SC+ IDs used (matches src/user/syscall_shim.pdx through sysno 94):
+//   1   = sys_write     (fd, buf, count)         -> n | -errno
+//   60  = sys_exit      (status)                 -> never returns
+//   87  = sys_socket    (domain, type, proto)    -> fd | -errno
+//   88  = sys_bind      (fd, local_port)         -> 0 | -errno
+//   89  = sys_listen    (fd, backlog)            -> 0 | -errno
+//   90  = sys_accept    (fd)                     -> new fd | -errno
+//   93  = sys_recv      (fd, buf, len)           -> n | -errno
+//   94  = sys_shutdown  (fd, how)                -> 0 | -errno
+// (Explicitly NOT USED: sysno 0 = sys_read. That is the whole point
+// of this witness -- a `grep -F 'mov rax, 0;' tests/tcp_server_no_
+// stdin_block.pdx` proves zero hits, i.e. the server surface never
+// issues a stdin read.)
+
+module TcpServerNoStdinBlock = structure {
+
+  // -------------------------------------------------------------------
+  // 4 KiB scratch buffer -- one page, matches sys_recv's natural
+  // transfer sweet spot. .bss, uninit, 8-byte aligned.
+  // -------------------------------------------------------------------
+  pub let mut tsnsb_buf : [u8; 4096] = uninit @align(8)
+
+  // -------------------------------------------------------------------
+  // Decimal scratch for the recv-count fingerprint (bytes=<N>).
+  // 20 bytes covers u64::MAX (20 digits); recv return is <=4096 so 4
+  // digits suffice but 20 is the paideia-os convention. Right-to-left
+  // fill; caller reads back from [first_digit_ptr, computed_len].
+  // -------------------------------------------------------------------
+  pub let mut tsnsb_dec_scratch : [u8; 20] = uninit @align(8)
+
+  // -------------------------------------------------------------------
+  // Diagnostic + fingerprint strings. Every literal is one line; the
+  // `_len` sibling is the wire byte count (excludes trailing NUL).
+  // -------------------------------------------------------------------
+  pub let tsnsb_msg_usage      : [u8; 37] = "usage: tsnsb <listen-port 1..65535>\n\0"
+  pub let tsnsb_msg_usage_len  : u64 = 36
+
+  pub let tsnsb_msg_setup      : [u8; 30] = "pdxsock server witness setup\n\0"
+  pub let tsnsb_msg_setup_len  : u64 = 29
+
+  pub let tsnsb_msg_bad_port     : [u8; 30] = "pdxsock server witness port?\n\0"
+  pub let tsnsb_msg_bad_port_len : u64 = 29
+
+  pub let tsnsb_msg_listen_ok    : [u8; 37] = "pdxsock server witness listening ok\n\0"
+  pub let tsnsb_msg_listen_ok_len : u64 = 36
+
+  pub let tsnsb_msg_accept_ok    : [u8; 34] = "pdxsock server witness accept ok\n\0"
+  pub let tsnsb_msg_accept_ok_len : u64 = 33
+
+  pub let tsnsb_msg_recv_pre     : [u8; 38] = "pdxsock server witness recv ok bytes=\0"
+  pub let tsnsb_msg_recv_pre_len : u64 = 37
+
+  pub let tsnsb_msg_newline      : [u8; 2]  = "\n\0"
+  pub let tsnsb_msg_newline_len  : u64 = 1
+
+  // -------------------------------------------------------------------
+  // _start -- witness entry point. argv[1] carries the listen port.
+  //
+  // Register plan (all callee-save; survives every SYSCALL by the
+  // amd64 fast-syscall convention):
+  //   r12 = argc (Step 0..argv gate)
+  //   r13 = argv base (Step 0..argv gate; unused thereafter)
+  //   r14 = recv-return byte count (for the fingerprint's digit encode)
+  //   r15 = fd (from sys_socket / sys_accept)
+  //   rbx = parsed port (0..65535)
+  //
+  // Effects: {mem, sysreg} for scratch touches + every SYSCALL.
+  // Caps:    @{fs, sched, cap} -- fs for write, sched for exit, cap
+  //          for the socket-syscall family.
+  // -------------------------------------------------------------------
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched, cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched, cap},
+      justification: "pdxsock v1.2.1 hotfix witness for pdxsock#20 (TCP server idle-stdin block). Standalone single-role ELF that opens a TCP listener on the argv[1] port, blocks in sys_accept, drains one sys_recv into a 4 KiB buffer, echoes the received bytes to stdout via sys_write(fd=1), emits a three-line fingerprint band on fd 2 (`pdxsock server witness listening ok\\n` post-listen, `pdxsock server witness accept ok\\n` post-accept, `pdxsock server witness recv ok bytes=<N>\\n` post-recv), sys_shutdowns the socket, and sys_exits 0. NEVER issues sys_read(fd=0) -- the whole point of the witness is to prove that a server-side surface can drive an accepted socket without touching stdin. A one-line grep (`grep -F 'mov rax, 0;' tests/tcp_server_no_stdin_block.pdx`) proves the surface is stdin-free by construction; any regression that reintroduces a stdin sys_read into a server-side entry surface trips this grep. Compile-only at v1.2.1 (tests/*.pdx builds under `bash tools/build.sh` to build-out/tests-tcp_server_no_stdin_block.o, not linked); runtime round-trip proof-of-life awaits the paideia-os smoke-runner extension that sequences a client against the witness. Register plan: r12=argc/temp (Step 0), r13=argv base (Step 0; unused after), r14=recv-return byte count (for the bytes=<N> digit encode), r15=fd (socket then accepted), rbx=parsed port (0..65535). Exit codes: 0=success, 2=usage refusal, 5=any setup-syscall failure (socket/bind/listen/accept/recv), 8=bad port (non-digit or > 65535). Encoder discipline (per user memory `pdx encoder pitfalls`): no `test rN, rN` (every zero-check is `cmp rN, 0`); no 2-op `imul r, imm` (decimal *10 in the port parser is shl+add+add); byte loads use `xor rN, rN; mov_b rN, [ptr]`; module name matches file basename PascalCase (TcpServerNoStdinBlock); every label prefixed `tsnsb_` (reserved-word discipline); SysV alignment (leaf syscall-only body, no cross-module `call`, no push/pop); no `and reg, imm64` on r8..r15; every string literal single-line with a sibling `_len` u64 (wire byte count, excludes NUL). Immediates: 4096 (recv len), 5555 (unused documentation port -- the real port is argv[1]-parsed into rbx), small fd/backlog integers all imm32-safe.",
+      block: {
+        // ---- Step 0: latch argc / argv from execve-ABI registers. ----
+        mov r12, rdi;                           // r12 = argc (temp)
+        mov r13, rsi;                           // r13 = argv
+
+        // ---- Step 1: argc gate. argc must be exactly 2. ----
+        cmp r12, 2;
+        jne tsnsb_usage;
+
+        // ---- Step 2: parse argv[1] as u16 port (0..65535). ----
+        mov rdi, [r13 + 8];                     // rdi = argv[1] = port_str
+        xor rax, rax;                            // acc = 0
+        xor rcx, rcx;                            // i = 0
+      tsnsb_port_loop:
+        xor r8, r8;
+        mov_b r8, [rdi + rcx*1];                 // byte = str[i]
+        cmp r8, 0;                               // NUL?
+        je tsnsb_port_done;
+        sub r8, 48;                              // '0' = 48
+        cmp r8, 9;
+        ja tsnsb_bad_port;                       // non-digit -> refuse
+        // acc = acc * 10 + digit  (shl+add+add per encoder-discipline).
+        mov r10, rax;                            // r10 = acc
+        shl rax, 3;                              // rax = acc*8
+        add rax, r10;                            // + acc = *9
+        add rax, r10;                            // + acc = *10
+        add rax, r8;                             // + digit
+        add rcx, 1;
+        jmp tsnsb_port_loop;
+      tsnsb_port_done:
+        cmp rcx, 0;
+        je tsnsb_bad_port;
+        cmp rax, 65535;
+        ja tsnsb_bad_port;
+        mov rbx, rax;                            // rbx = port
+
+        // ================================================================
+        // Server-side syscall band. NO sys_read anywhere below.
+        // ================================================================
+
+        // ---- sys_socket(AF_INET=2, SOCK_STREAM=1, 0). SC+ ID 87. ----
+        mov rdi, 2;                              // AF_INET
+        mov rsi, 1;                              // SOCK_STREAM
+        xor rdx, rdx;                            // proto = 0
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl tsnsb_setup_fail;
+        mov r15, rax;                            // r15 = listen fd
+
+        // ---- sys_bind(fd, port). SC+ ID 88. ----
+        // Kernel bind ABI: (fd, local_port); no sockaddr at MVP, local IP
+        // stamped from _ipv4_my_ip on KIND_TCP_SOCKET per src/kernel/
+        // core/syscall/handlers/sys_bind.pdx.
+        mov rdi, r15;
+        mov rsi, rbx;                            // port
+        mov rax, 88;
+        syscall;
+        cmp rax, 0;
+        jl tsnsb_setup_fail;
+
+        // ---- sys_listen(fd, 1). SC+ ID 89. ----
+        // backlog=1 matches main.pdx's server-mode choice and the
+        // kernel's MVP one-slot backlog per sys_listen.pdx header.
+        mov rdi, r15;
+        mov rsi, 1;
+        mov rax, 89;
+        syscall;
+        cmp rax, 0;
+        jl tsnsb_setup_fail;
+
+        // ---- fingerprint: "pdxsock server witness listening ok\n" ----
+        mov rdi, 2;                              // fd = stderr
+        lea rsi, [rip + tsnsb_msg_listen_ok];
+        mov rdx, 36;                             // tsnsb_msg_listen_ok_len
+        mov rax, 1;
+        syscall;
+
+        // ---- sys_accept(fd). SC+ ID 90. Blocks. ----
+        mov rdi, r15;
+        mov rax, 90;
+        syscall;
+        cmp rax, 0;
+        jl tsnsb_setup_fail;
+        mov r15, rax;                            // r15 = accepted fd
+
+        // ---- fingerprint: "pdxsock server witness accept ok\n" ----
+        mov rdi, 2;
+        lea rsi, [rip + tsnsb_msg_accept_ok];
+        mov rdx, 33;                             // tsnsb_msg_accept_ok_len
+        mov rax, 1;
+        syscall;
+
+        // ---- sys_recv(fd, buf, 4096). SC+ ID 93. One iteration only. ----
+        //
+        // The witness deliberately performs a SINGLE recv. Its purpose is
+        // to prove the server surface reaches the socket without a stdin
+        // block; it is not an echo server. A companion smoke driver may
+        // send one byte or a full 4096-byte payload; either lands here in
+        // one iteration and the byte count goes into the fingerprint.
+        mov rdi, r15;
+        lea rsi, [rip + tsnsb_buf];
+        mov rdx, 4096;
+        mov rax, 93;
+        syscall;
+        cmp rax, 0;
+        jle tsnsb_setup_fail;                    // peer EOF or error
+        mov r14, rax;                            // r14 = bytes received
+
+        // ---- sys_write(1, buf, r14). SC+ ID 1. Echo to stdout. ----
+        mov rdi, 1;                              // fd = stdout
+        lea rsi, [rip + tsnsb_buf];
+        mov rdx, r14;
+        mov rax, 1;
+        syscall;
+
+        // ---- fingerprint: "pdxsock server witness recv ok bytes=<N>\n" ----
+        mov rdi, 2;
+        lea rsi, [rip + tsnsb_msg_recv_pre];
+        mov rdx, 37;                             // tsnsb_msg_recv_pre_len
+        mov rax, 1;
+        syscall;
+
+        // ---- divide-by-10 loop: r14 (recv bytes) -> tsnsb_dec_scratch ----
+        // Right-to-left fill starting at scratch+19. r9 = remaining value,
+        // r11 = cursor. Zero fast-path emits '0' and jumps past the loop.
+        mov r9, r14;                             // value
+        lea r11, [rip + tsnsb_dec_scratch];
+        add r11, 19;                             // cursor at last stash byte
+        cmp r9, 0;
+        jne tsnsb_dec_loop;
+          mov al, 0x30;                          // '0'
+          mov [r11], al;
+          mov rdi, 2;
+          mov rsi, r11;
+          mov rdx, 1;
+          mov rax, 1;
+          syscall;
+          jmp tsnsb_dec_done;
+
+      tsnsb_dec_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;                            // zero-extend for div
+        div rcx;                                 // rax = quot, rdx = rem
+        add rdx, 0x30;                           // digit -> ASCII
+        mov [r11], dl;
+        mov r9, rax;
+        cmp r9, 0;
+        je tsnsb_dec_emit;
+        sub r11, 1;
+        jmp tsnsb_dec_loop;
+
+      tsnsb_dec_emit:
+        mov rdi, 2;
+        mov rsi, r11;
+        lea rax, [rip + tsnsb_dec_scratch];
+        add rax, 20;
+        sub rax, r11;                            // rax = digit count
+        mov rdx, rax;
+        mov rax, 1;
+        syscall;
+
+      tsnsb_dec_done:
+        // ---- write(2, "\n", 1) ----
+        mov rdi, 2;
+        lea rsi, [rip + tsnsb_msg_newline];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+
+        // ---- sys_shutdown(fd, SHUT_RDWR=2). SC+ ID 94. ----
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+
+        // ---- sys_exit(0). SC+ ID 60. ----
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ================================================================
+        // Diagnostic exits
+        // ================================================================
+
+      tsnsb_usage:
+        mov rdi, 2;
+        lea rsi, [rip + tsnsb_msg_usage];
+        mov rdx, 36;                             // tsnsb_msg_usage_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 2;                              // exit status = 2 (usage)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      tsnsb_bad_port:
+        mov rdi, 2;
+        lea rsi, [rip + tsnsb_msg_bad_port];
+        mov rdx, 29;                             // tsnsb_msg_bad_port_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 8;                              // exit status = 8 (bad port)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      tsnsb_setup_fail:
+        mov rdi, 2;
+        lea rsi, [rip + tsnsb_msg_setup];
+        mov rdx, 29;                             // tsnsb_msg_setup_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 5;                              // exit status = 5 (setup)
+        mov rax, 60;
+        syscall;
+        hlt;
+      }
+    }
+
+}

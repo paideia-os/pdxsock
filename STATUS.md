@@ -2,7 +2,7 @@
 
 **Wave:** R100 (user-space networking tools -- paideia-os
 `design/networking/r100-user-tools-plan.md` §7 + §13.6).
-**Overall status:** **v1.2.0 release-source landed** (2026-09-09).
+**Overall status:** **v1.2.1 hotfix landed** (2026-09-12; pdxsock#20).
 **Current milestone:** M5-001 (dual-signed release source:
 `release/manifest.pdxsig.txt` + `release/RELEASE-1.2.0.md` +
 `doc/pdxsock.pdxdoc` + CHANGELOG.md `[1.2.0]` stanza +
@@ -15,10 +15,13 @@ Before that: v1.1-B (semantic-pipe emission wire:
 `SockSessionRecord@0.1` via `sys_semantic_send` SC+ ID 115) -- landed.
 Before that: v1.1-A (real-body extraction; real socket-syscall path
 over sysnos 87..94) -- landed.
-**Version:** 1.2.0 (tag `v1.2.0` -- release-scaffolding-only minor
-bump over v1.1.0; dual-signed via `paideia-pq-sign::sign_release_
-artifact` at tag time, source-form manifest at
-`release/manifest.pdxsig.txt`).
+**Version:** 1.2.1 (tag `v1.2.1` -- hotfix over v1.2.0 for
+pdxsock#20 idle-stdin block; source-only delta, no release-source
+regeneration). See CHANGELOG `[1.2.1]` stanza for the root-cause
+narrative and the `pdxsock_pump_loop` mode-gate fix shape.
+`v1.2.0` (tag) remains the last release-scaffolded / dual-signed
+source landing; the v1.2.1 hotfix ships as an unsigned source-tag
+patch bump on the same release-source substrate.
 
 See `design/networking/r100-user-tools-plan.md` §13.6 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -98,6 +101,16 @@ See `design/networking/r100-user-tools-plan.md` §13.6 in the
       reaps the whole task and releases every cap slot, so the
       un-closed listen fd is not a leak (matches every other
       _start in the paideia-os src/user/ tree).
+      Hotfix at **v1.2.1** (pdxsock#20, 2026-09-12): the M2-002
+      "jumps directly into `pdxsock_pump_loop`" arrangement above
+      opened Step 1 of the pump with `sys_read(fd=0)`, blocking
+      the server on its OWN stdin post-accept. `pdxsock_pump_loop`
+      now gates Step 0 on `r14`: server mode (`r14 == 1`) branches
+      to a new `pdxsock_pump_recv` label and becomes a recv-only
+      pump (socket -> stdout -> loop); client-mode bytes are bit-
+      for-bit unchanged. Witness: `tests/tcp_server_no_stdin_
+      block.pdx` (compile-gated; runtime harness lands with
+      M4-001 sequencer).
 
 ### M3 -- UDP + audit + semantic-pipe
 

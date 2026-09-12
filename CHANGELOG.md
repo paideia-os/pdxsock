@@ -10,8 +10,11 @@ Version discipline:
              No v1.0.0 tag was ever cut.
   v1.1.0 -- unsigned source-tag release (2026-09-08). Real socket
              bodies + semantic-pipe emit wire.
-  v1.2.0 -- M5-001 dual-signed release-source landing (this stanza).
+  v1.2.0 -- M5-001 dual-signed release-source landing.
              Release scaffolding only; no source change from v1.1.0.
+  v1.2.1 -- Hotfix: TCP server (r14 == 1) inherited pdxsock_pump_loop's
+             leading sys_read(fd=0), freezing the server post-accept on
+             its own stdin (pdxsock#20).
 -->
 
 
@@ -436,6 +439,113 @@ Version discipline:
 ### Changed
 - **`STATUS.md`** -- M1-003 checklist entry flipped from `[ ]`
   to `[x]` with a per-argv-grammar note.
+
+## [1.2.1] - 2026-09-12
+
+Hotfix release. Retires the M2-002 conflation of client-mode and
+server-mode pump entry that let `sys_read(fd=0)` fire before the
+server ever touched the accepted socket. No new features; no source
+file added or removed; no ABI or record-shape change. Manifest
+`version` bumps `1.2.0 -> 1.2.1`, tag `v1.2.1` cut at this landing.
+
+### Fixed
+- **TCP server (`-l <port>`) no longer blocks post-accept on its own
+  stdin (pdxsock#20).** Root cause: `pdxsock_pump_loop` in
+  `src/main.pdx` opened with an unconditional `sys_read(fd=0, buf,
+  4096)` (Step 1 of the M2-001 bidirectional pump). The M2-002
+  server body (`pdxsock_server_body`) jumps into that pump directly
+  after `sys_accept` returns, so the pump's first instruction post-
+  accept was a stdin read against the server task's OWN fd 0 --
+  which blocks indefinitely unless the caller pipes bytes in. A
+  smoke driver that connects a client and expects the server to
+  observe the socket without also feeding the server's stdin
+  therefore hangs; the accepted-fd fingerprint (`pdxsock tcp-server
+  accept ok fd=<N>\n`) emits but no `sys_recv` follows.
+
+  Fix (in-place at `pdxsock_pump_loop`): a Step-0 mode gate --
+  `cmp r14, 1; je pdxsock_pump_recv;` -- that branches server-mode
+  entries around the stdin-read + `sys_send` arm and lands directly
+  on the `sys_recv` step. A new label `pdxsock_pump_recv` marks that
+  entry point; the client path falls through to it as before (Step-1
+  `sys_read(0)` and `sys_send(fd, n)` execute unchanged), and the
+  loop tail (`jmp pdxsock_pump_loop`) is unchanged so both modes
+  re-enter the mode gate on every iteration. Cost per iteration: one
+  `cmp` + one conditional jump, both predicted-taken from a stable
+  callee-save register.
+
+  Semantics after fix:
+  * Client mode (`r14 == 0`): bit-for-bit unchanged.
+    `stdin -> sys_send -> sys_recv -> sys_write(1) -> loop`,
+    identical to the v1.1-A' M2-001 shape.
+  * Server mode (`r14 == 1`): recv-only pump.
+    `sys_recv(fd) -> sys_write(1) -> loop`; the accepted socket
+    drives the tool, and the server task's own stdin is never
+    touched. Bytes-in accumulator (`r12`) is still populated; the
+    close-tail fingerprint (`pdxsock tcp-server bytes-in=<N>
+    bytes-out=<M>\n`) now honestly reports `bytes-out=0` in the
+    common recv-only case (server mode still exits into the shared
+    `pdxsock_client_close`, which does the mode-picked prefix write
+    per the M2-002 landing).
+
+  Follow-up work (out of scope at #20):
+  * **True bidirectional server pump** (stdin -> socket AS WELL AS
+    socket -> stdout) re-lands when either (a) `sys_poll` (sysno
+    102) grows TCP RX wake so the server can select between the
+    two fds without spinning, or (b) non-blocking `sys_read` on
+    stdin exists so the server can peek stdin without blocking.
+    Both are DEFERRED per the file-header note on the client-mode
+    blocking-alternation choice; issue #20 acknowledges this in
+    the "Fix (design decision needed)" §2/§3 alternatives without
+    picking them at this milestone.
+  * **Symmetric client-side idle-stdin block** (W39 finding, same
+    class): a client that connects to a silent peer and issues
+    `sys_read(0)` still blocks on the local stdin, which is honest
+    netcat behaviour and NOT a bug -- but the same non-blocking
+    stdin surface would let the client fall through when there is
+    no stdin data. Filed alongside #20 as a joint retirement
+    candidate once the primitives land.
+
+  Witness: `tests/tcp_server_no_stdin_block.pdx` (module
+  `TcpServerNoStdinBlock`, single-role ELF; compile-gated at v1.2.1
+  same as `tests/tcp_echo_smoke.pdx` -- runtime harness in
+  paideia-os smokes lands with the M4-001 sequencer). Body:
+  `sys_socket -> sys_bind(port from argv[1]) -> sys_listen(1) ->`
+  emit `pdxsock server witness listening ok\n` on fd 2
+  `-> sys_accept ->` emit `pdxsock server witness accept ok\n` on
+  fd 2 `-> sys_recv(fd, buf, 4096) -> sys_write(1, buf, n) ->`
+  emit `pdxsock server witness recv ok bytes=<N>\n` on fd 2
+  `-> sys_shutdown(fd, SHUT_RDWR) -> sys_exit(0)`. The witness
+  contains **no** `sys_read` opcode anywhere -- a grep
+  (`grep -F 'mov rax, 0;' tests/tcp_server_no_stdin_block.pdx`)
+  proves the server-side surface is stdin-free by construction.
+  Under the paideia-os smoke harness `INJECT_HOLD` budget the
+  witness reaches `listening ok\n` immediately (no stdin path) and
+  the smoke driver's client connect + one-byte payload send
+  reaches `recv ok bytes=1\n` in one round trip; a pre-#20 build
+  reached `accept ok\n` and then hung indefinitely on `sys_read(0)`
+  inside the shared pump.
+
+  Files touched:
+  * `src/main.pdx`: `pdxsock_pump_loop` gains a Step-0 mode-gate
+    comment block and a `cmp r14, 1; je pdxsock_pump_recv;` pair
+    at the top; the Step-2 sys_recv arm splits off as a new
+    `pdxsock_pump_recv:` label (unchanged bytes, new entry point).
+    Line delta: +21 comment lines / +2 code lines / +1 label /
+    -0 removed. `main.pdx` line count grows by ~28 lines; no
+    other function or `.bss` slot moves.
+  * `tests/tcp_server_no_stdin_block.pdx`: new file (module
+    `TcpServerNoStdinBlock`, ~110 wire lines including the file
+    header + one `_start` `pub let` block). Compiles under
+    `bash tools/build.sh` to `build-out/tests-tcp_server_no_stdin_
+    block.o` and gates only the encoder-discipline patterns.
+  * `manifest.pdxproj`: `version` bumps `1.2.0 -> 1.2.1`; no
+    `sources:` / `deps:` / `tests:` list edit (tests/ is globbed
+    at build time).
+  * `CHANGELOG.md`: this stanza.
+  * `STATUS.md`: M2-002 checklist entry gains a `pdxsock#20`
+    hotfix note.
+
+  Closes #20.
 
 ## [1.2.0] - 2026-09-09
 

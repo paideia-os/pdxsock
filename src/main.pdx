@@ -1161,6 +1161,36 @@ module Main = structure {
         // freely scratched.
 
       pdxsock_pump_loop:
+        // ---- Step 0 (v1.2-D, pdxsock#20): mode gate. ---------------------
+        //
+        // Server mode (r14 == 1) MUST NOT hit sys_read(fd=0) below. The
+        // pre-#20 pump entered Step 1 unconditionally, and the M2-002
+        // server body (which jumps here after sys_accept success) would
+        // therefore block on its OWN stdin before ever touching the
+        // freshly-accepted client socket -- freezing the server for the
+        // life of any caller that did not also pipe bytes into pdxsock's
+        // stdin. Client-side has honest use for the stdin read (that IS
+        // the netcat-shaped client's payload source); server-side does
+        // not (a listening tool's "input" is the socket, not stdin).
+        //
+        // Fix: r14 == 1 jumps forward to `pdxsock_pump_recv`, skipping
+        // the stdin-read + sys_send arm entirely. Server mode becomes a
+        // recv-only pump (sys_recv -> sys_write(fd=1) -> loop) -- the
+        // same shape the v1.1-A recv-only server had before M2-002
+        // conflated client and server under one bidirectional pump.
+        // Client mode (r14 == 0) falls through to Step 1 unchanged; the
+        // pre-#20 client behaviour is bit-for-bit preserved.
+        //
+        // Follow-up work (out of scope at #20): true bidirectional
+        // server pump (stdin -> socket AS WELL AS socket -> stdout) re-
+        // lands when either (a) TCP RX wake on sys_poll surfaces so the
+        // server can select between the two fds without spinning, or
+        // (b) non-blocking sys_read on stdin exists so the server can
+        // peek stdin without blocking. Both are DEFERRED per the file-
+        // header note on the client-mode blocking-alternation choice.
+        cmp r14, 1;
+        je pdxsock_pump_recv;
+
         // ---- Step 1: sys_read(0, buf, 4096). SC+ ID 0. ----
         xor rdi, rdi;                            // fd = 0 (stdin)
         lea rsi, [rip + pdxsock_buf];
@@ -1181,7 +1211,13 @@ module Main = structure {
         jl pdxsock_client_close;                 // send failed -> close
         add r13, rax;                            // bytes_out += n
 
+      pdxsock_pump_recv:
         // ---- Step 2: sys_recv(fd, buf, 4096). SC+ ID 93. ----
+        //
+        // Entry from two places: (a) fall-through from the Step-1
+        // sys_send arm in client mode; (b) direct jump from the Step-0
+        // mode gate in server mode. In both cases r15 (connection fd),
+        // r12 (bytes_in), r13 (bytes_out) are live and callee-save.
         mov rdi, r15;
         lea rsi, [rip + pdxsock_buf];
         mov rdx, 4096;
