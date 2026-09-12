@@ -15,6 +15,11 @@ Version discipline:
   v1.2.1 -- Hotfix: TCP server (r14 == 1) inherited pdxsock_pump_loop's
              leading sys_read(fd=0), freezing the server post-accept on
              its own stdin (pdxsock#20).
+  v1.2.2 -- Hotfix: --dry-run fabricated a runnable-looking preview
+             for the two STUB UDP modes even though the real-run body
+             for both exits 3 -- both dry-run classifier arms now
+             route to pdxsock_dry_udp_refuse (fd-1 UNIMPLEMENTED
+             preview + sys_exit(3)) (pdxsock#18).
 -->
 
 
@@ -439,6 +444,116 @@ Version discipline:
 ### Changed
 - **`STATUS.md`** -- M1-003 checklist entry flipped from `[ ]`
   to `[x]` with a per-argv-grammar note.
+
+## [1.2.2] - 2026-09-12
+
+Hotfix release. Retires the M1-003 `--dry-run` misbehaviour that
+fabricated a runnable-looking preview for the two STUB UDP modes
+(`udp-client`, `udp-server`) even though the real-run body for both
+exits 3 with a `pdxsock: udp stub` diagnostic. No new features; no
+source file added or removed; no ABI or record-shape change. Manifest
+`version` bumps `1.2.1 -> 1.2.2`, tag `v1.2.2` cut at this landing;
+release-source substrate unchanged (unsigned patch bump on the v1.2.0
+dual-signed source base, same shape as v1.2.1).
+
+### Fixed
+- **`--dry-run` no longer previews a stubbed UDP mode as if it were
+  runnable (pdxsock#18).** Root cause: `pdxsock_dry_argc4_u` and
+  `pdxsock_dry_argc4_l` in `src/main.pdx` both landed on
+  `pdxsock_dry_print` -- the friendly-preview writer that emits
+  `pdxsock dry-run mode=<M> target=<H>:<P>\n` on fd 1 and
+  `sys_exit(0)`. The corresponding real-run paths (`pdxsock_argv4_u`
+  and `pdxsock_argv4_l`) both jump to `pdxsock_udp_stub` which emits
+  `pdxsock: udp stub\n` on fd 2 and `sys_exit(3)`. An operator
+  scripting off dry-run output therefore had no way to distinguish
+  a live mode from a stub -- `--dry-run` promised a working
+  invocation the real tool would refuse.
+
+  Fix (in `src/main.pdx`): both dry-run UDP classifier arms now
+  jump to a new label `pdxsock_dry_udp_refuse` which composes the
+  honest refusal preview
+  `pdxsock dry-run mode=udp-<x> UNIMPLEMENTED\n`
+  on fd 1 (three-write chain: prefix / mode name / suffix) and
+  calls `sys_exit(3)`. The `pdxsock dry-run mode=` prefix is
+  preserved verbatim so existing grep anchors watching dry-run
+  output keep matching, and the trailing `UNIMPLEMENTED` sentinel
+  is a machine-parseable pattern a caller can gate on when it
+  wants to detect a stubbed mode explicitly. Exit code 3 matches
+  `pdxsock_udp_stub`'s exit exactly so a `--dry-run` invocation
+  fails the same way a real invocation would, and target info
+  (host, port) is intentionally withheld from the refusal line
+  (an UNIMPLEMENTED mode has no real target to preview; printing
+  one would recreate the fabrication issue #18 flags).
+
+  New literal at file scope:
+  `pdxsock_msg_dry_udp_stub : [u8; 16] = " UNIMPLEMENTED\n\0"`
+  (`_len : u64 = 15` for the wire byte count). Every other dry-run
+  literal (`pdxsock_msg_dry_prefix`, `pdxsock_msg_mode_udp_client`,
+  `pdxsock_msg_mode_udp_server`) is reused verbatim -- the refusal
+  path shares the mode-name family with the friendly-preview
+  writer, so the two paths render mode names byte-for-byte
+  identically.
+
+  Semantics after fix:
+  * `pdxsock --dry-run <host> <port>` (tcp-client): unchanged.
+  * `pdxsock --dry-run -l <port>` (tcp-server): unchanged.
+  * `pdxsock --dry-run -u <host> <port>` (udp-client): now emits
+    `pdxsock dry-run mode=udp-client UNIMPLEMENTED\n` on fd 1
+    and exits 3 (previously: emitted the friendly preview line
+    and exited 0).
+  * `pdxsock --dry-run -l -u <port>` (udp-server): now emits
+    `pdxsock dry-run mode=udp-server UNIMPLEMENTED\n` on fd 1
+    and exits 3 (previously: emitted the friendly preview line
+    and exited 0).
+
+  Follow-up work (out of scope at pdxsock#18):
+  * **When UDP client lands** (pdxsock#6, blocked on
+    `R100-PREP-002` per issue-map), the `pdxsock_dry_argc4_u`
+    classifier arm re-points from `pdxsock_dry_udp_refuse` back
+    to `pdxsock_dry_print` (the runnable-preview writer). The
+    refusal label and its `pdxsock_msg_dry_udp_stub` literal
+    remain in place until the last stubbed mode is retired; when
+    they are, both are deleted in a single follow-on commit.
+  * **`pdxsock_dry_argc4_l` (udp-server) has no lifecycle path**
+    -- per `design/networking/r100-user-tools-plan.md` §7.2 the
+    UDP-server shape is out of scope for v1 (needs `recvfrom`
+    peer-address out-params the caller-side ABI does not thread
+    through libpdx-net yet, and a different tool shape than the
+    single-connection-at-a-time pdxsock family). So this arm
+    stays on `pdxsock_dry_udp_refuse` indefinitely.
+
+  Mirror-of-real-run pattern: the fix follows mount.pdxfs#26's
+  dry-run gate-hoist discipline -- the dry-run bit check runs
+  BEFORE any mode-specific classify decides whether the tool
+  should actually perform the operation, and every dry-run
+  terminal path lands on a shape that matches its real-run
+  counterpart's exit behaviour (same exit code, same fd for
+  diagnostics, same "would/would-not run" honesty).
+
+### Changed
+- **`manifest.pdxproj` `version`** bumps `1.2.1 -> 1.2.2`; a note
+  in the file-header release-history block records the pdxsock#18
+  hotfix scope so a `git blame` of the version line surfaces
+  the change reason.
+- **`src/main.pdx` file header** grows a v1.2.2 stanza inside the
+  `--dry-run` deferred-features block explaining the new
+  refusal-path semantics for STUB modes.
+
+### Verification (paideia-os smoke, once M4-001 sequencer lands)
+- `pdxsock --dry-run -u 127.0.0.1 5555; echo $?` -- expect
+  `pdxsock dry-run mode=udp-client UNIMPLEMENTED\n` on fd 1
+  and exit code 3.
+- `pdxsock --dry-run -l -u 5555; echo $?` -- expect
+  `pdxsock dry-run mode=udp-server UNIMPLEMENTED\n` on fd 1
+  and exit code 3.
+- `pdxsock --dry-run 127.0.0.1 5555; echo $?` -- expect
+  `pdxsock dry-run mode=tcp-client target=127.0.0.1:5555\n` on
+  fd 1 and exit code 0 (unchanged pre-existing behaviour).
+- `pdxsock --dry-run -l 5555; echo $?` -- expect
+  `pdxsock dry-run mode=tcp-server target=0.0.0.0:5555\n` on
+  fd 1 and exit code 0 (unchanged pre-existing behaviour).
+
+Closes pdxsock#18.
 
 ## [1.2.1] - 2026-09-12
 

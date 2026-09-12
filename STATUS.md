@@ -2,7 +2,7 @@
 
 **Wave:** R100 (user-space networking tools -- paideia-os
 `design/networking/r100-user-tools-plan.md` §7 + §13.6).
-**Overall status:** **v1.2.1 hotfix landed** (2026-09-12; pdxsock#20).
+**Overall status:** **v1.2.2 hotfix landed** (2026-09-12; pdxsock#18).
 **Current milestone:** M5-001 (dual-signed release source:
 `release/manifest.pdxsig.txt` + `release/RELEASE-1.2.0.md` +
 `doc/pdxsock.pdxdoc` + CHANGELOG.md `[1.2.0]` stanza +
@@ -15,13 +15,15 @@ Before that: v1.1-B (semantic-pipe emission wire:
 `SockSessionRecord@0.1` via `sys_semantic_send` SC+ ID 115) -- landed.
 Before that: v1.1-A (real-body extraction; real socket-syscall path
 over sysnos 87..94) -- landed.
-**Version:** 1.2.1 (tag `v1.2.1` -- hotfix over v1.2.0 for
-pdxsock#20 idle-stdin block; source-only delta, no release-source
-regeneration). See CHANGELOG `[1.2.1]` stanza for the root-cause
-narrative and the `pdxsock_pump_loop` mode-gate fix shape.
-`v1.2.0` (tag) remains the last release-scaffolded / dual-signed
-source landing; the v1.2.1 hotfix ships as an unsigned source-tag
-patch bump on the same release-source substrate.
+**Version:** 1.2.2 (tag `v1.2.2` -- hotfix over v1.2.1 for
+pdxsock#18 --dry-run UDP fabrication; source-only delta, no
+release-source regeneration). See CHANGELOG `[1.2.2]` stanza for
+the root-cause narrative and the `pdxsock_dry_udp_refuse` gate-hoist
+fix shape. Preceded by v1.2.1 (tag `v1.2.1` -- hotfix over v1.2.0 for
+pdxsock#20 idle-stdin block; same source-only shape). `v1.2.0` (tag)
+remains the last release-scaffolded / dual-signed source landing;
+the v1.2.x hotfixes ship as unsigned source-tag patch bumps on the
+same release-source substrate.
 
 See `design/networking/r100-user-tools-plan.md` §13.6 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -54,8 +56,8 @@ See `design/networking/r100-user-tools-plan.md` §13.6 in the
       one argv slot and decrements `r12`) and enters
       `pdxsock_dry_run_entry`, which mirrors the socket-side
       classifier tree (`pdxsock_check_argc3` / `pdxsock_check_
-      argc4`) but never opens a socket. Every terminal path
-      composes the preview line
+      argc4`) but never opens a socket. Every runnable-mode
+      terminal path composes the preview line
       `pdxsock dry-run mode=<M> target=<H>:<P>\n` via a
       7-sys_write chain to fd 1 (prefix / mode / " target=" /
       host-or-`0.0.0.0` / ":" / port / "\n") and `sys_exit(0)`.
@@ -70,6 +72,17 @@ See `design/networking/r100-user-tools-plan.md` §13.6 in the
       run` at any argv index) deferred -- may be subsumed by the
       M1-002 argv scanner move (pdxsock#2). Dry-run smoke
       deferred to M4 alongside the TCP/UDP echo smokes.
+      Hotfix at **v1.2.2** (pdxsock#18, 2026-09-12): the two
+      STUB-mode dry-run arms (udp-client, udp-server) no longer
+      route to the friendly-preview writer -- both jump to a new
+      `pdxsock_dry_udp_refuse` label that emits
+      `pdxsock dry-run mode=udp-<x> UNIMPLEMENTED\n` on fd 1 and
+      `sys_exit(3)`. Exit code and honesty now match the real-run
+      `pdxsock_udp_stub` shape (which also exits 3). TCP modes
+      unchanged. When UDP client lands at M3-001 (pdxsock#6),
+      `pdxsock_dry_argc4_u` re-points back to
+      `pdxsock_dry_print`; the udp-server arm stays on the
+      refusal path (out of scope per R100 plan §7.2).
 
 ### M2 -- TCP client + server real bodies
 

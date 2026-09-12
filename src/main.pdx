@@ -242,7 +242,18 @@
 //     `pdxsock dry-run mode=<M> target=<H>:<P>\n` on fd 1 and
 //     sys_exit(0) without opening any socket. Positional-flexibility
 //     (--dry-run at any argv index) deferred -- may be subsumed by
-//     the M1-002 argv scanner move (pdxsock#2).
+//     the M1-002 argv scanner move (pdxsock#2). v1.2.2 hotfix
+//     (pdxsock#18): dry-run now refuses to fabricate a runnable-
+//     looking preview for a mode whose real-run body is STUB (exit
+//     3). At this release that gates udp-client and udp-server:
+//     both dry-run classifier arms jump to `pdxsock_dry_udp_refuse`
+//     which composes the honest refusal line
+//       `pdxsock dry-run mode=udp-<x> UNIMPLEMENTED\n`
+//     on fd 1 and sys_exit(3) -- matching `pdxsock_udp_stub`'s exit
+//     code exactly. TCP-client / TCP-server dry-run behaviour is
+//     bit-for-bit unchanged (their real-run bodies do open sockets
+//     and complete, so the friendly preview stays honest for those
+//     shapes).
 //   - Bidirectional stdin/socket forwarding: LANDED at v1.1-A'
 //     (pdxsock#4, M2-001) as blocking-alternation over sys_read(0)
 //     and sys_recv(fd). See the v1.1-A' scope block above for the
@@ -397,6 +408,37 @@ module Main = structure {
 
   pub let pdxsock_msg_newline          : [u8; 2]  = "\n\0"
   pub let pdxsock_msg_newline_len      : u64      = 1
+
+  // -----------------------------------------------------------------
+  // v1.2.2 --dry-run STUB-mode refusal suffix (pdxsock#18).
+  //
+  // Appended after the mode name on the honest-refusal preview line
+  // for every mode whose real-run body exits 3 as STUB. At v1.2.2
+  // this covers udp-client (`-u <host> <port>`) and udp-server
+  // (`-l -u <port>`) -- both jump to `pdxsock_udp_stub` at real-run
+  // and exit 3 with `pdxsock: udp stub\n` on fd 2.
+  //
+  // Pre-v1.2.2, --dry-run for those modes composed the same
+  // `pdxsock dry-run mode=<M> target=<H>:<P>\n` line the runnable
+  // TCP modes emit and then sys_exit(0) -- so an operator scripting
+  // off dry-run output had no way to distinguish a live mode from a
+  // stub. The v1.2.2 refusal line
+  //   `pdxsock dry-run mode=udp-<x> UNIMPLEMENTED\n`
+  // preserves the `pdxsock dry-run mode=` prefix (existing grep
+  // anchors keep matching) and adds a trailing UNIMPLEMENTED
+  // sentinel a caller can pattern-match to detect the stub, and
+  // the refusal path exits 3 to mirror the real-run's exit code
+  // exactly. Emitted on fd 1 (the same fd as the normal preview)
+  // so the whole dry-run output stream stays coherent -- a mixed
+  // pipeline of --dry-run invocations lands every line on fd 1.
+  //
+  // Wire format (three-write chain reused from pdxsock_dry_print):
+  //   write(1, pdxsock_msg_dry_prefix, 21)
+  //   write(1, pdxsock_msg_mode_udp_client|_udp_server, 10)
+  //   write(1, pdxsock_msg_dry_udp_stub, 15)
+  // -----------------------------------------------------------------
+  pub let pdxsock_msg_dry_udp_stub     : [u8; 16] = " UNIMPLEMENTED\n\0"
+  pub let pdxsock_msg_dry_udp_stub_len : u64      = 15
 
   // -----------------------------------------------------------------
   // v1.1-A' full-duplex TCP client fingerprints (issue #4, M2-001).
@@ -2033,7 +2075,11 @@ module Main = structure {
         jmp pdxsock_usage;
 
       pdxsock_dry_argc4_u:
-        // "-u <host> <port>" -- udp-client.
+        // "-u <host> <port>" -- udp-client. v1.2.2 (pdxsock#18):
+        // real-run body for this shape is `pdxsock_udp_stub` (exit
+        // 3, "udp stub" diagnostic); dry-run therefore lands on the
+        // matching honest-refusal path rather than the friendly
+        // preview writer that runnable TCP modes use.
         xor rax, rax;
         mov_b rax, [rbx + 2];
         cmp rax, 0;                              // NUL after 'u'
@@ -2041,13 +2087,18 @@ module Main = structure {
         mov r14, 2;
         mov rbp, [r13 + 16];                    // host = effective argv[2]
         mov r15, [r13 + 24];                    // port = effective argv[3]
-        jmp pdxsock_dry_print;
+        jmp pdxsock_dry_udp_refuse;
 
       pdxsock_dry_argc4_l:
-        // "-l -u <port>" -- udp-server refusal (kept as an explicit
-        // dry-run preview so operators can confirm the shape they
-        // typed classifies as they expect, even though the real-run
-        // form of this invocation exits 3 with "udp stub").
+        // "-l -u <port>" -- udp-server refusal. v1.2.2 (pdxsock#18):
+        // real-run body for this shape is `pdxsock_udp_stub` (exit
+        // 3, "udp stub" diagnostic); dry-run therefore lands on the
+        // matching honest-refusal path rather than the friendly
+        // preview writer. Retires the pre-v1.2.2 posture that emitted
+        // a runnable-looking preview even though the real invocation
+        // exits 3 -- operators scripting off dry-run output now see
+        // the same UNIMPLEMENTED sentinel the udp-client refusal
+        // emits, and the two modes share the exit-3 refusal tail.
         xor rax, rax;
         mov_b rax, [rbx + 2];
         cmp rax, 0;                              // NUL after 'l'
@@ -2067,7 +2118,7 @@ module Main = structure {
         jne pdxsock_usage;
         mov r14, 3;
         mov r15, [r13 + 24];                    // port = effective argv[3]
-        jmp pdxsock_dry_print;
+        jmp pdxsock_dry_udp_refuse;
 
         // ================================================================
         // Dry-run preview writer.
@@ -2191,6 +2242,86 @@ module Main = structure {
 
         // ---- sys_exit(0) ----
         xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ================================================================
+        // v1.2.2 dry-run STUB-mode refusal (pdxsock#18).
+        //
+        // Reached exclusively from `pdxsock_dry_argc4_u` (r14 == 2,
+        // udp-client) and `pdxsock_dry_argc4_l` (r14 == 3, udp-server),
+        // both of whose real-run classifiers jump to `pdxsock_udp_stub`
+        // (exit 3, "udp stub" diagnostic). This label lands the honest
+        // dry-run counterpart: it composes the refusal preview
+        //   `pdxsock dry-run mode=udp-<x> UNIMPLEMENTED\n`
+        // on fd 1 (matching the normal preview writer's fd choice so
+        // dry-run output stays a single-fd stream) and sys_exit(3) --
+        // exit code identical to the real-run's, so a caller cannot
+        // observe the preview claiming success while the real
+        // invocation refuses.
+        //
+        // Target info (host, port) is intentionally withheld from the
+        // refusal line: an UNIMPLEMENTED mode has no real target to
+        // preview, and printing one would recreate the very
+        // fabrication issue #18 flags. The `pdxsock dry-run mode=`
+        // prefix is preserved so operators grepping dry-run output for
+        // the shared anchor keep matching, and the UNIMPLEMENTED
+        // sentinel gives them a pattern-match to gate on when they
+        // want to detect a stubbed mode explicitly.
+        //
+        // Register state at entry: r14 in {2, 3} (mode), r15 = port_str
+        // ptr (unused past classify), rbp = host_str ptr for r14 == 2
+        // (unused past classify). Callee-save regs survive every
+        // syscall by the amd64 fast-syscall convention. rdi/rsi/rdx/rax
+        // are freely scratched. Every SYSCALL below trashes rcx/r11
+        // but neither is read after its issuing syscall.
+        //
+        // Future maintenance: when a new mode's real body lands, its
+        // dry-run classifier stops jumping here and rejoins the
+        // runnable-preview writer (`pdxsock_dry_print`). When the last
+        // stubbed mode is retired, this label and its supporting
+        // literal (`pdxsock_msg_dry_udp_stub`) may be deleted.
+        //
+        // Encoder discipline per file header: no `test`, `cmp reg, imm`
+        // fits imm32, byte loads use `xor rax, rax; mov_b`, no scaled
+        // `[reg + N*imm]` for N outside {1,2,4,8}. Labels
+        // `pdxsock_dry_udp_refuse_*` -- pdxsock_ prefix satisfies the
+        // paideia-as reserved-word discipline.
+        // ================================================================
+
+      pdxsock_dry_udp_refuse:
+        // ---- write(1, "pdxsock dry-run mode=", 21) ----
+        mov rdi, 1;
+        lea rsi, [rip + pdxsock_msg_dry_prefix];
+        mov rdx, 21;                             // pdxsock_msg_dry_prefix_len
+        mov rax, 1;
+        syscall;
+
+        // ---- write(1, mode_str, 10) ----
+        // Pick the mode pointer by r14. r14 == 2 -> udp-client;
+        // r14 == 3 falls through to the udp-server literal (only two
+        // callers reach this label, both filed above).
+        lea rsi, [rip + pdxsock_msg_mode_udp_client];
+        cmp r14, 2;
+        je pdxsock_dry_udp_refuse_write_mode;
+        lea rsi, [rip + pdxsock_msg_mode_udp_server];
+
+      pdxsock_dry_udp_refuse_write_mode:
+        mov rdi, 1;
+        mov rdx, 10;                             // pdxsock_msg_mode_name_len
+        mov rax, 1;
+        syscall;
+
+        // ---- write(1, " UNIMPLEMENTED\n", 15) ----
+        mov rdi, 1;
+        lea rsi, [rip + pdxsock_msg_dry_udp_stub];
+        mov rdx, 15;                             // pdxsock_msg_dry_udp_stub_len
+        mov rax, 1;
+        syscall;
+
+        // ---- sys_exit(3) -- matches pdxsock_udp_stub's exit code. ----
+        mov rdi, 3;
         mov rax, 60;
         syscall;
         hlt

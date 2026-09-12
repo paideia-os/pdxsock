@@ -35,9 +35,19 @@
 # than regressing 1.1-shape code under a 1.0 tag. The M5-001
 # dual-signed release-source landing therefore ships at v1.2.0 as
 # planned in the v1.1.0 CHANGELOG stanza.
+#
+# v1.2.2 hotfix (pdxsock#18, 2026-09-12): --dry-run for the two
+# STUB UDP modes (udp-client, udp-server) previously fabricated a
+# runnable-looking preview line even though the real-run body for
+# both modes is `pdxsock_udp_stub` (exit 3, "udp stub" diagnostic).
+# The dry-run classifier now routes both UDP arms to a dedicated
+# refusal path (`pdxsock_dry_udp_refuse` in src/main.pdx) which
+# composes `pdxsock dry-run mode=udp-<x> UNIMPLEMENTED\n` on fd 1
+# and sys_exit(3) -- exit code identical to `pdxsock_udp_stub`.
+# Source-only delta over v1.2.1; no release-source regeneration.
 
 name        = pdxsock
-version     = 1.2.1
+version     = 1.2.2
 kind        = tool
 entry       = _start                    # src/main.pdx
 output      = build-out/pdxsock.elf
