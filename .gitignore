@@ -1,0 +1,18 @@
+# pdxsock .gitignore — closes paideia-os/pdxsock#19.
+# Build products (build-out/), objects, binaries, ELFs, archives
+# must never be tracked (they diverge from source and bloat the repo).
+
+build-out/
+*.o
+*.bin
+*.elf
+*.a
+*.so
+*.so.*
+
+# Editor / OS noise
+*~
+.DS_Store
+
+# Local scratch
+.scratch/
