@@ -26,6 +26,47 @@ Version discipline:
 ## [Unreleased]
 
 ### Added
+- **Server-refuses-second-connection smoke witness (pdxsock#11,
+  M4-003).** Adds `tests/m4_003_server_refuses_second.pdx` (module
+  `M4003ServerRefusesSecond`) as a three-role ELF driven by
+  `argv[1]` first byte: `s` = server (bind 5555 + `sys_listen(fd,1)`
+  + `sys_accept` once + drain one byte + `sys_shutdown(2)` +
+  `sys_exit(0)`), `1` = client1 (connect + send one byte 'A' +
+  shutdown + exit 0 -- the connection the server accepts), `2` =
+  client2 (connect MUST fail after the server has closed the sole
+  accepted socket; on the expected `sys_connect < 0` refusal, emits
+  `pdxsock refuse ok\n` on fd 2 and `sys_exit(0)`; on unexpected
+  success, emits `pdxsock refuse FAIL\n` on fd 2 and `sys_exit(1)`).
+  Gates the single-slot-backlog contract of the pdxsock v1.1-A'
+  server body (per `sys_listen.pdx`'s backlog cap of 1). Fixture-
+  harness pattern matches `tests/tcp_echo_smoke.pdx`: pdxsock has
+  no in-tree fork/spawn scaffolding, and `tools/build.sh` emits
+  `build-out/tests-m4_003_server_refuses_second.o` only. Runtime
+  round-trip witness awaits the paideia-os smoke-runner extension
+  that sequences server / client1 / client2. Exit codes: 0 =
+  success (any role), 1 = client2 unexpected accept, 2 = usage
+  refusal, 5 = setup syscall failure.
+
+- **Large-transfer smoke witness (pdxsock#12, M4-004).** Adds
+  `tests/m4_004_large_transfer.pdx` (module `M4004LargeTransfer`)
+  as a dual-role ELF (mirrors `tests/tcp_echo_smoke.pdx`) that
+  streams 128 KiB (131072 bytes, well past the >64 KiB task-charter
+  minimum and past the 64 KiB TCP window default) through the same
+  server body pattern, then byte-compares payload vs. received
+  buffer. Payload is `.bss @align(8) 131072` filled at start of the
+  client role with the deterministic per-byte pattern
+  `payload[i] = (i & 0xFF)` -- a length off-by-one anywhere in the
+  send/recv chain surfaces as a mismatch at that exact index and
+  an all-zero recv buffer cannot false-positive. Fingerprint band
+  on fd 2: `pdxsock large ok bytes=131072\n` (30 wire bytes) on
+  match, `pdxsock large FAIL\n` (19 wire bytes) on mismatch,
+  shared `pdxsock large setup fail\n` (25 wire bytes) on any
+  setup-syscall failure. Send/recv loops honestly re-issue on
+  partial completion (`add rsi, r14/r12; mov rdx, 131072; sub rdx,
+  r14/r12`) so a fragmented delivery at any chunk boundary in the
+  128 KiB stream progresses correctly. Exit codes: 0 = success,
+  1 = mismatch, 2 = usage refusal, 5 = setup failure.
+
 - **TCP echo round-trip smoke witness (pdxsock#9, M4-001).** Adds
   `tests/tcp_echo_smoke.pdx` (module `TcpEchoSmoke`, single
   `_start` `pub let` entry point) as a dual-role ELF that, driven

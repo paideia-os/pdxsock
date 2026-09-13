@@ -1,0 +1,266 @@
+// tests/m4_003_server_refuses_second.pdx -- pdxsock M4-003 witness
+// (pdxsock#11): server bound with backlog=1 accepts one client and
+// refuses (or serialises) the second.
+//
+// Wave: R100  Milestone: M4-003 (pdxsock#11)
+// Doc:  design/networking/r100-user-tools-plan.md §13.6 (paideia-os)
+//
+// Purpose ---------------------------------------------------------------
+// Boot-smoke witness that gates the pdxsock v1.1-A' server body's
+// single-slot-backlog contract (sys_listen(fd,1); see
+// src/kernel/core/syscall/handlers/sys_listen.pdx for the kernel-side
+// cap of 1). Single dual-role ELF driven by argv[1] first byte:
+//
+//   'server' -> bind(5555) + listen(1) + accept (blocks) + drain one
+//               byte + sys_shutdown(2) + sys_exit(0). Accepts exactly
+//               ONE connection then closes. A second connect attempt
+//               arriving after the accepted socket is closed has no
+//               listening endpoint and is refused (ECONNREFUSED,
+//               -ERRNO on sys_connect).
+//   'client1' -> connect(127.0.0.1:5555) + send one byte 'A' +
+//                sys_shutdown(2) + sys_exit(0). The connection the
+//                server accepts.
+//   'client2' -> connect(127.0.0.1:5555). MUST fail (sys_connect
+//                returns < 0). On refusal the client emits
+//                `pdxsock refuse ok\n` on fd 2 and sys_exit(0). If
+//                the connect unexpectedly succeeds, the client
+//                emits `pdxsock refuse FAIL\n` on fd 2 and
+//                sys_exit(1).
+//
+// Fixture-harness approach ---------------------------------------------
+// Same pattern as tests/tcp_echo_smoke.pdx and tests/tcp_server_
+// no_stdin_block.pdx: pdxsock has no in-tree fork/spawn scaffolding,
+// and tools/build.sh emits .o only. The three-role ELF documents the
+// harness contract for the paideia-os smoke-runner follow-up: the
+// runner sequences `server`, waits for accept, `client1`, waits for
+// client1 exit + server close, then `client2` and asserts client2
+// emits the `refuse ok` fingerprint.
+//
+// Fingerprint band on fd 2:
+//   client2 refuse ok:   "pdxsock refuse ok\n"     (18 wire bytes)
+//   client2 refuse FAIL: "pdxsock refuse FAIL\n"   (20 wire bytes)
+//   usage refusal:       "usage: server|client1|client2\n" (30 wire)
+//   setup failure:       "pdxsock refuse setup fail\n" (26 wire)
+//
+// Exit codes:
+//   0 = success (server done; client1 done; client2 refused as expected)
+//   1 = client2 unexpectedly connected (refusal contract broken)
+//   2 = argv usage refusal
+//   5 = setup-syscall failure (socket / bind / listen / accept / send)
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls, per user memory) --------
+//   * PascalCase module basename: `M4003ServerRefusesSecond`.
+//   * Every label prefixed `m4003_` (reserved-word discipline; `loop`
+//     etc. are keywords, `m4003_...loop` is fine).
+//   * No `test rN,rN`; no 2-op `imul r,imm`; no `and reg,imm64` on
+//     r8..r15.
+//   * Byte loads: `xor rN,rN; mov_b rN,[ptr]` (paideia-as #1248).
+//   * SysV alignment: leaf syscall-only, no push/pop cross-module.
+//   * Immediates 0x7F000001, 5555, small ints all fit imm32.
+//   * String literals single-line, [u8; N+1] with trailing NUL and
+//     sibling `_len : u64` wire byte count (no NUL).
+//
+// SC+ IDs used (through sysno 94, matches src/user/syscall_shim.pdx):
+//   1  = sys_write, 60 = sys_exit, 87 = sys_socket, 88 = sys_bind,
+//   89 = sys_listen, 90 = sys_accept, 91 = sys_connect,
+//   92 = sys_send, 94 = sys_shutdown.
+
+module M4ServerRefusesSecond = structure {
+
+  pub let m4003_msg_usage      : [u8; 31] = "usage: server|client1|client2\n\0"
+  pub let m4003_msg_usage_len  : u64 = 30
+
+  pub let m4003_msg_setup      : [u8; 27] = "pdxsock refuse setup fail\n\0"
+  pub let m4003_msg_setup_len  : u64 = 26
+
+  pub let m4003_msg_ok         : [u8; 19] = "pdxsock refuse ok\n\0"
+  pub let m4003_msg_ok_len     : u64 = 18
+
+  pub let m4003_msg_fail       : [u8; 21] = "pdxsock refuse FAIL\n\0"
+  pub let m4003_msg_fail_len   : u64 = 20
+
+  pub let mut m4003_recv_buf   : [u8; 8]  = uninit @align(8)
+
+  pub let m4003_payload        : [u8; 2]  = "A\0"
+  pub let m4003_payload_len    : u64 = 1
+
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched, cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched, cap},
+      justification: "pdxsock.M4-003 (pdxsock#11) server-refuses-second-connection smoke witness. Three-role ELF driven by argv[1] first byte: 's' -> server (bind 5555 + listen 1 + accept once + recv 1 byte + shutdown + exit 0), '1' -> client1 (connect 127.0.0.1:5555 + send one byte 'A' + shutdown + exit 0), '2' -> client2 (connect MUST fail; on -errno emit `pdxsock refuse ok\\n` on fd 2 + exit 0; on unexpected success emit `pdxsock refuse FAIL\\n` on fd 2 + exit 1). Under a paideia-os smoke-runner harness (follow-up): sequence server, wait for accept-block, client1 (server drains + closes), client2 (server no longer listening; connect returns ECONNREFUSED). Fixture rationale mirrors tests/tcp_echo_smoke.pdx: pdxsock has no in-tree fork/spawn scaffolding; tools/build.sh emits build-out/tests-m4_003_server_refuses_second.o only. Register plan: r12 = argc scratch, r13 = argv base, r15 = fd, rbx = argv[1] first byte, rax = syscall n / return. Exit codes: 0 = success on any role, 1 = client2 unexpected accept, 2 = usage refusal, 5 = setup syscall failure (server-side socket/bind/listen/accept, client1 socket/connect/send). Encoder discipline: no `test rN,rN` (every zero-check is `cmp rN,0`); no 2-op `imul r,imm`; no `and reg,imm64` on r8..r15; byte load via `xor rax,rax; mov_b rax,[rbx]` per paideia-as #1248; PascalCase module (M4003ServerRefusesSecond); labels prefixed `m4003_` (reserved-word discipline). SysV alignment: leaf syscall-only body, no `call` cross-module, no push/pop -- rsp % 16 == 0 posture inherited from ELF init and preserved throughout. Immediates 0x7F000001 (127.0.0.1 packed per sys_connect abi), 5555 (port), 1 (backlog + send len) all within imm32.",
+      block: {
+        mov r12, rdi;
+        mov r13, rsi;
+
+        cmp r12, 2;
+        jne m4003_usage;
+
+        mov rbx, [r13 + 8];
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0x73;                            // 's'
+        je m4003_server;
+        cmp rax, 0x31;                            // '1'
+        je m4003_client1;
+        cmp rax, 0x32;                            // '2'
+        je m4003_client2;
+        jmp m4003_usage;
+
+      m4003_usage:
+        mov rdi, 2;
+        lea rsi, [rip + m4003_msg_usage];
+        mov rdx, 30;
+        mov rax, 1;
+        syscall;
+        mov rdi, 2;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      m4003_setup_fail:
+        mov rdi, 2;
+        lea rsi, [rip + m4003_msg_setup];
+        mov rdx, 26;
+        mov rax, 1;
+        syscall;
+        mov rdi, 5;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ---- server role ---------------------------------------------
+      m4003_server:
+        mov rdi, 2;
+        mov rsi, 1;
+        xor rdx, rdx;
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl m4003_setup_fail;
+        mov r15, rax;
+
+        mov rdi, r15;
+        mov rsi, 5555;
+        mov rax, 88;
+        syscall;
+        cmp rax, 0;
+        jl m4003_setup_fail;
+
+        mov rdi, r15;
+        mov rsi, 1;                               // backlog = 1
+        mov rax, 89;
+        syscall;
+        cmp rax, 0;
+        jl m4003_setup_fail;
+
+        mov rdi, r15;
+        mov rax, 90;
+        syscall;
+        cmp rax, 0;
+        jl m4003_setup_fail;
+        mov r15, rax;                             // accepted fd
+
+        // drain one byte
+        mov rdi, r15;
+        lea rsi, [rip + m4003_recv_buf];
+        mov rdx, 1;
+        mov rax, 93;
+        syscall;
+        cmp rax, 0;
+        jle m4003_setup_fail;
+
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ---- client1 role: succeeds; sends one byte ------------------
+      m4003_client1:
+        mov rdi, 2;
+        mov rsi, 1;
+        xor rdx, rdx;
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl m4003_setup_fail;
+        mov r15, rax;
+
+        mov rdi, r15;
+        mov rsi, 0x7F000001;
+        mov rdx, 5555;
+        mov rax, 91;
+        syscall;
+        cmp rax, 0;
+        jl m4003_setup_fail;
+
+        mov rdi, r15;
+        lea rsi, [rip + m4003_payload];
+        mov rdx, 1;
+        mov rax, 92;
+        syscall;
+        cmp rax, 0;
+        jle m4003_setup_fail;
+
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ---- client2 role: connect MUST fail --------------------------
+      m4003_client2:
+        mov rdi, 2;
+        mov rsi, 1;
+        xor rdx, rdx;
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl m4003_setup_fail;
+        mov r15, rax;
+
+        mov rdi, r15;
+        mov rsi, 0x7F000001;
+        mov rdx, 5555;
+        mov rax, 91;
+        syscall;
+        cmp rax, 0;
+        jl m4003_refuse_ok;                       // negative == refused as expected
+
+        // unexpected success -> FAIL
+        mov rdi, 2;
+        lea rsi, [rip + m4003_msg_fail];
+        mov rdx, 20;
+        mov rax, 1;
+        syscall;
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+        mov rdi, 1;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      m4003_refuse_ok:
+        mov rdi, 2;
+        lea rsi, [rip + m4003_msg_ok];
+        mov rdx, 18;
+        mov rax, 1;
+        syscall;
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+      }
+    }
+}

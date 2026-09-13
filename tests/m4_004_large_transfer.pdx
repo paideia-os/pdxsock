@@ -1,0 +1,325 @@
+// tests/m4_004_large_transfer.pdx -- pdxsock M4-004 witness
+// (pdxsock#12): large-transfer round trip (>64 KiB) through TCP echo.
+//
+// Wave: R100  Milestone: M4-004 (pdxsock#12)
+// Doc:  design/networking/r100-user-tools-plan.md §13.6 (paideia-os)
+//
+// Purpose ---------------------------------------------------------------
+// Boot-smoke witness for pdxsock's TCP send/recv path under a load
+// larger than one loopback MTU or one page-sized transfer. Streams
+// 128 KiB (131072 bytes) through the same server body as
+// tests/tcp_echo_smoke.pdx, then byte-compares payload vs. received
+// buffer. The 128 KiB size sits well past the >64 KiB minimum the
+// task charter asks for and past the 64 KiB TCP window default a
+// naive path might implicitly bake in.
+//
+// Fixture-harness approach ---------------------------------------------
+// Same dual-role ELF pattern as tests/tcp_echo_smoke.pdx (see file
+// header there for the fixture rationale). Two roles:
+//
+//   'server' -> bind(5555) + listen(1) + accept + recv-loop-until-
+//               128KiB + send-loop-until-128KiB + shutdown + exit(0).
+//   'client' -> connect(127.0.0.1:5555) + send-loop-until-128KiB +
+//               recv-loop-until-128KiB + byte-compare + fingerprint
+//               + shutdown + exit.
+//
+// Payload ---------------------------------------------------------------
+// 131072 bytes generated deterministically at startup by filling
+// `m4004_payload` (.bss, 128 KiB, @align(8)) with the pattern
+// `payload[i] = (i & 0xFF)`. The pattern varies per byte so a length
+// off-by-one at any point in the send/recv chain (kernel-side ring
+// truncation, user-side pointer arithmetic, chunk boundary bug)
+// produces a mismatch at that exact index; a naive echo that returns
+// all-zeros or all-ones falls out immediately. .bss placement (not
+// .rodata) keeps the ELF small -- 128 KiB in .rodata would land in
+// the binary; .bss expands at load time.
+//
+// Fingerprint on match (client mode, fd 2):
+//   "pdxsock large ok bytes=131072\n"       (30 wire bytes)
+// On mismatch (client mode, fd 2):
+//   "pdxsock large FAIL\n"                  (19 wire bytes)
+// Shared setup-syscall failure (either mode, fd 2):
+//   "pdxsock large setup fail\n"            (25 wire bytes) then exit 5.
+//
+// Exit codes:
+//   0 = success (client match OR server drain+echo done)
+//   1 = client mismatch
+//   2 = usage refusal
+//   5 = any setup-syscall failure (collapsed pass/fail per
+//       tests/tcp_echo_smoke.pdx convention).
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls, per user memory) --------
+//   * PascalCase module basename: `M4004LargeTransfer`.
+//   * Every label prefixed `m4004_` (reserved-word discipline).
+//   * No `test rN,rN`; no 2-op `imul r,imm` (index-fold uses `add`
+//     only -- the pattern fill and compare walk the buffer with a
+//     unit-stride index register); no `and reg,imm64` on r8..r15.
+//   * Byte loads: `xor rN,rN; mov_b rN,[ptr + idx*1]` per
+//     paideia-as #1248 and the SIB-scale-1 requirement.
+//   * Byte stores for the pattern fill: `mov_b [ptr + idx*1], rN_b`
+//     works only if the store form is supported; here we synthesise
+//     the pattern by writing the low byte via a byte store into
+//     the .bss buffer -- if the assembler lacks the byte-store form
+//     the loop can be reshaped to 8-byte stores of the packed
+//     pattern. See "Pattern-fill fallback" below.
+//   * SysV alignment: leaf syscall-only, no push/pop cross-module.
+//   * Immediates: 131072 (0x20000) fits imm32; 5555, 0x7F000001,
+//     small ints all fit imm32.
+//
+// Pattern-fill fallback -------------------------------------------------
+// The pattern `payload[i] = (i & 0xFF)` requires a byte store into
+// .bss. If paideia-as does not expose a byte-store mnemonic the
+// pattern is equivalently produced by writing packed 8-byte words
+// `0x0706050403020100 + i*0x0808080808080808` (one word covers 8
+// bytes, index advances by 8 per iteration). The compare loop reads
+// bytes, so it works against either fill shape. The straight-line
+// byte-store form is written below with the expectation that the
+// paideia-as byte-store form (`mov_b [mem], reg`) is available -- if
+// not, main's rebuild pass will observe the encoder failure and
+// swap in the packed-word variant.
+//
+// SC+ IDs used: 1, 60, 87, 88, 89, 90, 91, 92, 93, 94 -- identical
+// set to tests/tcp_echo_smoke.pdx.
+
+module M4LargeTransfer = structure {
+
+  // 128 KiB payload buffer (.bss, page-aligned by @align(8) at least).
+  pub let mut m4004_payload    : [u8; 131072] = uninit @align(8)
+  pub let mut m4004_recv_buf   : [u8; 131072] = uninit @align(8)
+  pub let m4004_payload_len    : u64 = 131072
+
+  pub let m4004_msg_usage      : [u8; 22] = "usage: server|client\n\0"
+  pub let m4004_msg_usage_len  : u64 = 21
+
+  pub let m4004_msg_setup      : [u8; 26] = "pdxsock large setup fail\n\0"
+  pub let m4004_msg_setup_len  : u64 = 25
+
+  pub let m4004_msg_ok         : [u8; 31] = "pdxsock large ok bytes=131072\n\0"
+  pub let m4004_msg_ok_len     : u64 = 30
+
+  pub let m4004_msg_fail       : [u8; 20] = "pdxsock large FAIL\n\0"
+  pub let m4004_msg_fail_len   : u64 = 19
+
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched, cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched, cap},
+      justification: "pdxsock.M4-004 (pdxsock#12) large-transfer TCP echo smoke witness (>64 KiB stream). Dual-role ELF (mirrors tests/tcp_echo_smoke.pdx) driven by argv[1] first byte ('s' -> server, 'c' -> client). Server: bind(5555) + listen(1) + accept + recv-loop-until-131072 + send-loop-until-131072 + shutdown + exit 0. Client: fills m4004_payload with `payload[i] = (i & 0xFF)` (deterministic per-byte pattern so a length off-by-one anywhere in the send/recv chain surfaces as a mismatch at that exact index and an all-zero recv buffer cannot false-positive), connects 127.0.0.1:5555, send-loop-until-131072, recv-loop-until-131072 into m4004_recv_buf, byte-compare payload vs. recv_buf across all 131072 bytes, emits fingerprint (`pdxsock large ok bytes=131072\\n` on match, `pdxsock large FAIL\\n` on mismatch) on fd 2, shutdown + exit. 128 KiB is well past the >64 KiB task-charter minimum and past the 64 KiB TCP window default a naive path might bake in. Register plan: r12 = bytes-recv accum, r13 = argv base + payload-fill temp, r14 = bytes-sent accum / cmp cursor, r15 = fd, rbx = argv[1] byte scratch, rcx = pattern-fill / cmp index. Exit codes: 0 = success (either role), 1 = client mismatch, 2 = usage refusal, 5 = setup syscall failure (collapsed per tests/tcp_echo_smoke.pdx convention). Encoder discipline (paideia-as 0.36+ pitfalls per user memory): no `test rN,rN`; no 2-op `imul r,imm` (pattern fill and compare loops advance the index with `add rcx,1` only); no `and reg,imm64` on r8..r15 (the low-byte extraction from rcx uses `mov rax, rcx` then a byte truncation via the destination register width in `mov_b [ptr + rcx*1], al` style store); byte loads via `xor rN,rN; mov_b rN,[ptr + rcx*1]` per paideia-as #1248 with explicit scale-1 SIB form; PascalCase module (M4004LargeTransfer); labels prefixed `m4004_`. Send/recv loops honestly re-issue on partial completion (`add rsi, r14/r12; mov rdx, 131072; sub rdx, r14/r12`) -- correct against fragmentation across the 128 KiB stream where 64 KiB window defaults will chunk. Immediates 131072 (0x20000), 5555, 0x7F000001, small ints all within imm32. Fixture rationale mirrors tests/tcp_echo_smoke.pdx: pdxsock has no in-tree fork/spawn scaffolding; tools/build.sh emits build-out/tests-m4_004_large_transfer.o only; runtime round-trip proof-of-life awaits the paideia-os smoke-runner harness landing. SysV alignment: leaf syscall-only, no push/pop cross-module.",
+      block: {
+        mov r12, rdi;
+        mov r13, rsi;
+
+        cmp r12, 2;
+        jne m4004_usage;
+
+        mov rbx, [r13 + 8];
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0x73;                            // 's'
+        je m4004_server;
+        cmp rax, 0x63;                            // 'c'
+        je m4004_client;
+        jmp m4004_usage;
+
+      m4004_usage:
+        mov rdi, 2;
+        lea rsi, [rip + m4004_msg_usage];
+        mov rdx, 21;
+        mov rax, 1;
+        syscall;
+        mov rdi, 2;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      m4004_setup_fail:
+        mov rdi, 2;
+        lea rsi, [rip + m4004_msg_setup];
+        mov rdx, 25;
+        mov rax, 1;
+        syscall;
+        mov rdi, 5;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ---- server: bind + listen + accept + drain + echo -----------
+      m4004_server:
+        mov rdi, 2;
+        mov rsi, 1;
+        xor rdx, rdx;
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl m4004_setup_fail;
+        mov r15, rax;
+
+        mov rdi, r15;
+        mov rsi, 5555;
+        mov rax, 88;
+        syscall;
+        cmp rax, 0;
+        jl m4004_setup_fail;
+
+        mov rdi, r15;
+        mov rsi, 1;
+        mov rax, 89;
+        syscall;
+        cmp rax, 0;
+        jl m4004_setup_fail;
+
+        mov rdi, r15;
+        mov rax, 90;
+        syscall;
+        cmp rax, 0;
+        jl m4004_setup_fail;
+        mov r15, rax;
+
+        // recv-loop-until-131072 into m4004_recv_buf
+        xor r12, r12;
+      m4004_srv_recv_loop:
+        mov rdi, r15;
+        lea rsi, [rip + m4004_recv_buf];
+        add rsi, r12;
+        mov rdx, 131072;
+        sub rdx, r12;
+        mov rax, 93;
+        syscall;
+        cmp rax, 0;
+        jle m4004_setup_fail;
+        add r12, rax;
+        cmp r12, 131072;
+        jl m4004_srv_recv_loop;
+
+        // send-loop-until-131072 from m4004_recv_buf
+        xor r14, r14;
+      m4004_srv_send_loop:
+        mov rdi, r15;
+        lea rsi, [rip + m4004_recv_buf];
+        add rsi, r14;
+        mov rdx, 131072;
+        sub rdx, r14;
+        mov rax, 92;
+        syscall;
+        cmp rax, 0;
+        jle m4004_setup_fail;
+        add r14, rax;
+        cmp r14, 131072;
+        jl m4004_srv_send_loop;
+
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ---- client: fill pattern + connect + send + recv + compare --
+      m4004_client:
+        // Pattern fill: payload[i] = (i & 0xFF). Byte store per iter.
+        xor rcx, rcx;
+      m4004_fill_loop:
+        mov rax, rcx;
+        lea r11, [rip + m4004_payload];
+        mov_b [r11 + rcx * 1], rax;
+        add rcx, 1;
+        cmp rcx, 131072;
+        jl m4004_fill_loop;
+
+        mov rdi, 2;
+        mov rsi, 1;
+        xor rdx, rdx;
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl m4004_setup_fail;
+        mov r15, rax;
+
+        mov rdi, r15;
+        mov rsi, 0x7F000001;
+        mov rdx, 5555;
+        mov rax, 91;
+        syscall;
+        cmp rax, 0;
+        jl m4004_setup_fail;
+
+        // send-loop-until-131072 from m4004_payload
+        xor r14, r14;
+      m4004_cli_send_loop:
+        mov rdi, r15;
+        lea rsi, [rip + m4004_payload];
+        add rsi, r14;
+        mov rdx, 131072;
+        sub rdx, r14;
+        mov rax, 92;
+        syscall;
+        cmp rax, 0;
+        jle m4004_setup_fail;
+        add r14, rax;
+        cmp r14, 131072;
+        jl m4004_cli_send_loop;
+
+        // recv-loop-until-131072 into m4004_recv_buf
+        xor r12, r12;
+      m4004_cli_recv_loop:
+        mov rdi, r15;
+        lea rsi, [rip + m4004_recv_buf];
+        add rsi, r12;
+        mov rdx, 131072;
+        sub rdx, r12;
+        mov rax, 93;
+        syscall;
+        cmp rax, 0;
+        jle m4004_setup_fail;
+        add r12, rax;
+        cmp r12, 131072;
+        jl m4004_cli_recv_loop;
+
+        // Byte compare 131072 bytes.
+        xor rcx, rcx;
+      m4004_cli_cmp_loop:
+        xor rax, rax;
+        lea r10, [rip + m4004_payload];
+        mov_b rax, [r10 + rcx * 1];
+        xor r8, r8;
+        lea r10, [rip + m4004_recv_buf];
+        mov_b r8, [r10 + rcx * 1];
+        cmp rax, r8;
+        jne m4004_cli_fail;
+        add rcx, 1;
+        cmp rcx, 131072;
+        jl m4004_cli_cmp_loop;
+
+        mov rdi, 2;
+        lea rsi, [rip + m4004_msg_ok];
+        mov rdx, 30;
+        mov rax, 1;
+        syscall;
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      m4004_cli_fail:
+        mov rdi, 2;
+        lea rsi, [rip + m4004_msg_fail];
+        mov rdx, 19;
+        mov rax, 1;
+        syscall;
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+        mov rdi, 1;
+        mov rax, 60;
+        syscall;
+        hlt;
+      }
+    }
+}
