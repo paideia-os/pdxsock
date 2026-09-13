@@ -127,10 +127,15 @@ See `design/networking/r100-user-tools-plan.md` §13.6 in the
 
 ### M3 -- UDP + audit + semantic-pipe
 
-- [ ] **M3-001** -- UDP client: connected-UDP mode. Held for after
-      libpdx-net stabilises the sendto/recvfrom shim surface;
-      sysnos 96/97 landed at R93.M2-004 (#2052) so the kernel side
-      is unblocked.
+- [x] **M3-001** -- UDP client: connected-UDP mode. Landed at v1.3.0
+      (pdxsock#6): R100-PREP-002 extended sys_socket/sys_connect/
+      sys_send/sys_recv (SC+ 87/91/92/93) to accept SOCK_DGRAM,
+      confirmed at the handler source (not the sendto/recvfrom SC+
+      96/97 path this checklist item originally assumed -- connected-
+      UDP reuses the same send/recv calls as TCP, no new sysnos
+      needed). `-u <host> <port>` opens a real SOCK_DGRAM=2 socket,
+      connects it, and reuses the TCP client's pump/close/emit tail
+      verbatim (new mode value `r14 == 2`).
 - [ ] **M3-002** -- libpdx-audit integration.
 - [~] **M3-003** -- semantic-pipe: `SockSessionRecord@0.1` (bytes-
       in/out, peer, duration). **Partially met** by **v1.1-B**
@@ -154,7 +159,15 @@ See `design/networking/r100-user-tools-plan.md` §13.6 in the
 
 - [ ] **M4-001** -- TCP echo round-trip smoke (client against a
       `pdxsock -l` fixture).
-- [ ] **M4-002** -- UDP echo round-trip smoke (once M3-001 lands).
+- [x] **M4-002** -- UDP echo round-trip smoke (once M3-001 lands).
+      Landed alongside M3-001 at v1.3.0 (pdxsock#10):
+      `tests/udp_echo_smoke.pdx` (module `UdpEchoSmoke`), a dual-role
+      ELF where both roles bind a fixed local port before connecting
+      to each other (sidesteps sys_recvfrom peer-discovery, not yet
+      wired into any pdxsock argv path). Compile-gated only, same as
+      every other tests/*.pdx witness in this repo; runtime proof-of-
+      life awaits the paideia-os smoke-runner extension M4-001's
+      entry already names.
 - [ ] **M4-003** -- server-refuses-second-connection behaviour
       smoke + documentation.
 - [ ] **M4-004** -- large-transfer smoke (buffer-boundary correctness,

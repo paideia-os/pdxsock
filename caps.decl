@@ -9,31 +9,40 @@
 # the parent held none.
 #
 # pdxsock's role: netcat-adjacent general TCP/UDP client + server
-# (paideia-os design/networking/r100-user-tools-plan.md §7). At v1.1-A
-# the TCP client + TCP server paths are wired to the R72.M1-005
-# (sysnos 87..94) socket syscall family; UDP client (sendto/recvfrom,
-# sysnos 96/97) lands with pdxsock.M3-001 once R100-PREP-002's user
-# surface stabilises. UDP server is out of scope per §7.2.
+# (paideia-os design/networking/r100-user-tools-plan.md §7). TCP
+# client, TCP server, TCP mirror-echo server, and (as of v1.3.0,
+# pdxsock#6) connected-UDP client are all wired to the R72.M1-005 /
+# R100-PREP-002 (sysnos 87..94, extended to SOCK_DGRAM) socket syscall
+# family. UDP server (a bound-not-connected `-l -u` listener) remains
+# out of scope per §7.2 -- it would need sys_recvfrom's peer-address
+# out-params (SC+ 97) threaded into the generic `-l` path, which this
+# tool does not do (the mirror server sidesteps the need by fixing the
+# peer via sys_connect instead of discovering it via recvfrom).
 #
 # Kind rationale:
 #   KIND_USER          -- invoker attribution (audit record identity);
 #                         every satellite in the R100 wave lists this.
-#   KIND_TCP_SOCKET    -- mandatory here because both the client path
-#                         (socket + connect + send + recv + shutdown)
-#                         and the server path (socket + bind + listen +
-#                         accept + recv + shutdown) fault without
-#                         cap-slot 0 holding a TCP socket cap once
-#                         sys_socket returns. The parent process (init /
-#                         shell / a launcher) must have SEND (0x2) +
-#                         RECV (0x1) + INVOKE (0x8) available or the
-#                         first sys_send / sys_recv refuses with
-#                         -EACCES.
-#   KIND_UDP_SOCKET    -- optional at v1.1-A (UDP client body is a
-#                         documented stub, per src/main.pdx's
-#                         pdxsock_udp_not_yet path). Kept in the
-#                         decl so the -u client path can be flipped
-#                         from stub-to-real by src/*.pdx edits alone
-#                         at M3-001, without a caps.decl churn.
+#   KIND_TCP_SOCKET    -- mandatory here because the TCP client path
+#                         (socket + connect + send + recv + shutdown),
+#                         the TCP server path (socket + bind + listen +
+#                         accept + recv + send + shutdown), and the TCP
+#                         mirror-server path (same setup as the server,
+#                         recv+send in the reverse-direction pump) all
+#                         fault without cap-slot 0 holding a TCP socket
+#                         cap once sys_socket returns. The parent
+#                         process (init / shell / a launcher) must have
+#                         SEND (0x2) + RECV (0x1) + INVOKE (0x8)
+#                         available or the first sys_send / sys_recv
+#                         refuses with -EACCES.
+#   KIND_UDP_SOCKET    -- optional. As of v1.3.0 (pdxsock#6) the `-u
+#                         <host> <port>` client path is REAL (connected-
+#                         UDP: socket + connect + send + recv +
+#                         shutdown over the same sysnos as TCP, per
+#                         R100-PREP-002). Stays optional because `-u`
+#                         is an opt-in invocation shape, not every
+#                         pdxsock run touches a UDP socket -- a parent
+#                         that never grants this cap still gets a full
+#                         TCP client/server/mirror.
 #   KIND_IPC_ENDPOINT  -- optional; documentation-only at v1.1-B.
 #                         The v1.1-B semantic-pipe emission wire
 #                         (paideia-os/pdxsock #16) uses
@@ -48,5 +57,5 @@
 
 !KIND_USER               0x001   # invoker attribution (audit)
 !KIND_TCP_SOCKET         0x00B   # READ (0x1) + SEND (0x2) + INVOKE (0x8)
- KIND_UDP_SOCKET         0x00B   # optional -- v1.1-A stub; M3-001 real
+ KIND_UDP_SOCKET         0x00B   # optional -- real connected-UDP client since v1.3.0 (M3-001)
  KIND_IPC_ENDPOINT       0x001   # optional -- documentation-only (see above)

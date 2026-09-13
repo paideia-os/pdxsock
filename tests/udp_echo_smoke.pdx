@@ -1,0 +1,392 @@
+// tests/udp_echo_smoke.pdx -- pdxsock M4-002 UDP echo round-trip smoke (pdxsock#10).
+//
+// Wave: R100  Milestone: M4-002 (pdxsock#10)
+// Doc:  design/networking/r100-user-tools-plan.md §13.6 (paideia-os)
+//
+// Purpose ---------------------------------------------------------------
+// Boot-smoke witness that exercises the pdxsock v1.3.0 connected-UDP
+// client body (pdxsock#6, M3-001, unblocked by R100-PREP-002) round-
+// tripping against a UDP peer that echoes a datagram verbatim. Sends a
+// fixed 32-byte payload, verifies the exact echo comes back byte-for-
+// byte, and emits a grep-friendly fingerprint line on fd 2. Structural
+// sibling of tests/tcp_echo_smoke.pdx (pdxsock#9, M4-001) -- same dual-
+// role-ELF fixture shape, same fingerprint/exit-code conventions,
+// adapted for UDP's connectionless, datagram-boundary-preserving
+// transport instead of TCP's byte-stream-with-partial-completion one.
+//
+// Fixture-harness approach ---------------------------------------------
+// Same rationale as tests/tcp_echo_smoke.pdx's file header: pdxsock has
+// no in-tree fork/spawn scaffolding, and (as of v1.3.0) pdxsock's
+// generic `-l -u` UDP-server path is STILL out of scope (it would need
+// sys_recvfrom's peer-address out-params to learn who to reply to,
+// which the tool does not thread into `-l`). The v1.3.0 mirror server
+// (`-l -m <port>`, pdxsock#14) is TCP-only. So this witness, like its
+// TCP sibling, is a single dual-role ELF selected by argv[1] ('s' ->
+// server, 'c' -> client).
+//
+// UDP-specific fixed-peer trick: a UDP "server" cannot sys_connect
+// back to a client's address without first LEARNING that address (via
+// sys_recvfrom, SC+ 97 -- not exercised by this witness), because a
+// UDP client's local port is normally kernel-assigned ephemeral
+// (sys_connect.pdx: "auto-assigns ephemeral local_port if never
+// bound"). This witness sidesteps that by having BOTH roles bind a
+// FIXED, hardcoded local port before connecting -- the client binds
+// UES_CLIENT_PORT (15556) and the server binds UES_SERVER_PORT
+// (15557), then each sys_connect's to the OTHER's fixed port. Once
+// both sockets are connected-UDP, sys_send / sys_recv (SC+ 92/93) are
+// byte-identical calls to the TCP smoke's -- the kernel dispatches on
+// the fd's KIND (stamped by sys_socket's SOCK_DGRAM=2 vs. SOCK_STREAM=1
+// argument), not on any type tag this file threads through.
+//
+// Datagram-boundary handling: UNLIKE the TCP smoke's recv-loop-until-32
+// (correct for a byte stream that may fragment), a UDP sys_recv reads
+// AT MOST ONE DATAGRAM per call. Looping recv on a short read would
+// wait for a NEW, unrelated datagram rather than "the rest of this
+// one" -- there is no rest; UDP either delivers the whole 32-byte
+// payload in one enqueued datagram or it does not arrive at all. Both
+// send and recv here are therefore SINGLE calls, not loops: a return
+// other than exactly 32 (for the payload-carrying recv/send) is
+// treated as a setup failure, not something to retry.
+//
+// Payload ---------------------------------------------------------------
+// Fixed 32-byte deterministic ASCII pattern (deliberately distinct
+// from the TCP smoke's payload so a stray cross-transport mix-up is
+// hex-dump obvious): "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+//
+// Fingerprint format ----------------------------------------------------
+// On match (client mode):    "pdxsock udp-echo ok bytes=32\n"   (29 bytes)
+// On mismatch (client mode): "pdxsock udp-echo FAIL\n"          (22 bytes)
+// On any setup-syscall failure (either mode): the shared
+// "pdxsock udp-echo setup fail\n" (28 bytes) diagnostic on fd 2, then
+// exit 5. Mirrors tests/tcp_echo_smoke.pdx's pass/fail collapse rather
+// than main.pdx's full diagnostic taxonomy.
+//
+// Exit codes (identical taxonomy to tests/tcp_echo_smoke.pdx):
+//   0 = client-mode success (echo matched) OR server-mode success
+//       (datagram echoed back)
+//   1 = client-mode echo mismatch (FAIL fingerprint emitted)
+//   2 = argv usage refusal (`udp_echo_smoke` with no or wrong argv[1])
+//   5 = any setup-syscall failure (socket / bind / connect / send /
+//       recv, or an unexpected short/oversized datagram), either mode
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls, per user memory) --------
+//   * No `test rN, rN` -- every zero-check is `cmp rN, 0`.
+//   * No 2-op `imul r, imm` -- port and IP are hardcoded immediates.
+//   * No `and r11, imm64` on r8..r15 -- no bit-mask operations.
+//   * Byte loads via `xor rN, rN; mov_b rN, [ptr]` (paideia-as #1248).
+//   * PascalCase module basename (`UdpEchoSmoke` from
+//     `udp_echo_smoke.pdx`).
+//   * Every label prefixed `ues_` (reserved-word discipline: `loop`
+//     etc. are keywords; `ues_cli_cmp_loop` etc. have `loop` only as a
+//     suffix, which is fine).
+//   * SysV alignment: leaf syscall-only body, no `call` cross-module,
+//     no push/pop -- rsp % 16 == 0 posture inherited from ELF process
+//     init and preserved throughout.
+//   * Immediates: `0x7F000001` (127.0.0.1), `15556`/`15557` (ports,
+//     both >= 1024 so no R_NET_PRIVILEGED_PORT gate applies per
+//     sys_bind.pdx's R96.M4-001 note), `32` (payload len) all imm32-safe.
+//   * String literals: single-line, trailing NUL declared in the array
+//     size with a sibling `_len` constant carrying the wire byte count.
+//
+// SC+ IDs used (matches design/user/syscall-table.md; ground truth is
+// src/kernel/core/syscall/handlers/*.pdx, NOT any external sysno list):
+//   1   = sys_write    (fd, buf, count)         -> n | -errno
+//   60  = sys_exit     (status)                 -> never returns
+//   87  = sys_socket   (domain, type, proto)    -> fd | -errno
+//   88  = sys_bind     (fd, local_port)         -> 0 | -errno
+//   91  = sys_connect  (fd, remote_ip, port)    -> 0 | -errno
+//   92  = sys_send     (fd, buf, len)           -> n | -errno
+//   93  = sys_recv     (fd, buf, len)           -> n | -errno
+//   94  = sys_shutdown (fd, how)                -> 0 | -errno
+
+module UdpEchoSmoke = structure {
+
+  // -------------------------------------------------------------------
+  // Fixed local ports both roles bind before connecting (see file
+  // header's "fixed-peer trick"): client binds 15556, server binds
+  // 15557, and each connects to the other's fixed port -- both are
+  // imm32-safe literals inlined at each sys_bind/sys_connect call site
+  // rather than named constants (matching tests/tcp_echo_smoke.pdx's
+  // style of inlining its 5555). Both >= 1024 (no privileged-port cap
+  // needed) and distinct from that file's 5555 so the two smokes never
+  // collide if a future harness runs them concurrently.
+  // -------------------------------------------------------------------
+
+  // -------------------------------------------------------------------
+  // 32-byte fixed payload (.rodata). Deterministic ASCII pattern,
+  // deliberately distinct from tests/tcp_echo_smoke.pdx's payload.
+  // -------------------------------------------------------------------
+  pub let ues_payload      : [u8; 33] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\0"
+  pub let ues_payload_len  : u64 = 32
+
+  // -------------------------------------------------------------------
+  // 32-byte receive buffer (.bss, @align(8)). Shared by both roles --
+  // each is a separate process invocation, so there is no cross-role
+  // aliasing hazard.
+  // -------------------------------------------------------------------
+  pub let mut ues_recv_buf : [u8; 32] = uninit @align(8)
+
+  // -------------------------------------------------------------------
+  // Diagnostic + fingerprint strings.
+  // -------------------------------------------------------------------
+  pub let ues_msg_usage      : [u8; 22] = "usage: server|client\n\0"
+  pub let ues_msg_usage_len  : u64 = 21
+
+  pub let ues_msg_ok         : [u8; 30] = "pdxsock udp-echo ok bytes=32\n\0"
+  pub let ues_msg_ok_len     : u64 = 29
+
+  pub let ues_msg_fail       : [u8; 23] = "pdxsock udp-echo FAIL\n\0"
+  pub let ues_msg_fail_len   : u64 = 22
+
+  pub let ues_msg_setup      : [u8; 29] = "pdxsock udp-echo setup fail\n\0"
+  pub let ues_msg_setup_len  : u64 = 28
+
+  // -------------------------------------------------------------------
+  // _start -- witness entry point. argv[1] picks role.
+  //
+  // Register plan (all callee-save, so they survive every syscall
+  // without push/pop -- SYSCALL preserves callee-save regs by the
+  // amd64 fast-syscall convention):
+  //   r12 = argc (dispatch only) then unused
+  //   r13 = argv base (dispatch only)
+  //   r14 = bytes-sent / recv return-value / byte-compare cursor
+  //   r15 = fd (from sys_socket)
+  //   rbx = argv[1] first-byte scratch during dispatch
+  //
+  // Exit statuses: see file header.
+  //
+  // Effects: {mem, sysreg} for scratch touches + every SYSCALL.
+  // Caps:    @{fs, sched, cap} -- fs for read/write, sched for exit,
+  //          cap for the socket-syscall family.
+  // -------------------------------------------------------------------
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched, cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched, cap},
+      justification: "pdxsock.M4-002 (pdxsock#10) UDP echo round-trip smoke witness. Single dual-role ELF that, driven by argv[1] first byte ('s' -> server, 'c' -> client), is either a UDP echo peer (bind UES_SERVER_PORT=15557, connect back to UES_CLIENT_PORT=15556 on 127.0.0.1, recv one datagram, send it back verbatim, shutdown+exit) or the round-trip client (bind UES_CLIENT_PORT=15556, connect to UES_SERVER_PORT=15557, send the fixed 32-byte payload, recv one datagram, byte-compare, emit fingerprint, shutdown+exit). Structural sibling of tests/tcp_echo_smoke.pdx (pdxsock#9); see this file's header for the fixed-peer trick that lets a connectionless UDP 'server' reply without sys_recvfrom's peer-address out-params (SC+ 97, not exercised here). Fixture-harness rationale identical to the TCP smoke: pdxsock has no in-tree fork/spawn scaffolding, and pdxsock main.pdx's generic `-l -u` path is still out of scope at v1.3.0 (needs recvfrom peer-address discovery); this witness therefore hand-rolls both roles as one dual-role ELF, gated only for encoder-correctness under tools/build.sh's compile-only tests/*.pdx pass -- runtime round-trip proof-of-life awaits the paideia-os smoke-harness landing (same follow-up the TCP smoke's header names). Payload is 32 bytes of `ABCDEFGHIJKLMNOPQRSTUVWXYZ012345` -- deliberately distinct from the TCP smoke's lowercase/digit payload so a cross-transport mix-up would be hex-dump obvious. Datagram-boundary discipline: UDP delivers at most one datagram per sys_recv (SC+ 93), unlike TCP's byte-stream partial-completion semantics the sibling smoke's recv-loop-until-32 handles -- so both the payload send and the payload recv here are SINGLE calls, and any return other than exactly 32 is a setup failure (exit 5), never something to retry (a retry would consume an unrelated future datagram, not 'the rest of this one' -- there is no rest). Register plan: r12/r13 = argc/argv (dispatch only), r14 = bytes-sent / recv-length / byte-compare cursor, r15 = fd, rbx = argv[1] byte scratch during dispatch. Exit codes: 0=success, 1=mismatch, 2=usage refusal, 5=any setup-syscall failure or unexpected datagram length. Encoder discipline (per user memory `pdx encoder pitfalls`): no `test rN, rN` (every zero-check is `cmp rN, 0`); no 2-op `imul r, imm` (no *10 fold -- ports and IP are hardcoded); byte loads use `xor rN, rN; mov_b rN, [ptr]`; module name matches file basename PascalCase (UdpEchoSmoke); every label prefixed `ues_`. Immediates 0x7F000001 (127.0.0.1), 15556/15557 (ports, both >= 1024 so sys_bind's R_NET_PRIVILEGED_PORT gate per R96.M4-001 never fires), 32 (payload len) all fit in imm32. SysV alignment: leaf syscall-only body, no `call` cross-module, no push/pop -- rsp % 16 == 0 posture inherited from ELF process init. No `and reg, imm64` on r8..r15 anywhere. Every failure path emits its diagnostic to fd 2 (stderr) before sys_exit, matching pdxsock main.pdx's diagnostic-vs-payload split.",
+      block: {
+        // ---- Step 0: latch argc / argv from execve-ABI registers. ----
+        mov r12, rdi;                           // r12 = argc
+        mov r13, rsi;                           // r13 = argv
+
+        // ---- Step 1: argc gate. argc must be exactly 2. ----
+        cmp r12, 2;
+        jne ues_usage;
+
+        // ---- Step 2: argv[1] first byte picks role. ----
+        // 's' (0x73) -> server; 'c' (0x63) -> client; anything else -> usage.
+        mov rbx, [r13 + 8];                     // rbx = argv[1]
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0x73;                          // 's'
+        je ues_server_body;
+        cmp rax, 0x63;                          // 'c'
+        je ues_client_body;
+        jmp ues_usage;
+
+        // ================================================================
+        // Diagnostic exits
+        // ================================================================
+
+      ues_usage:
+        mov rdi, 2;                             // fd = stderr
+        lea rsi, [rip + ues_msg_usage];
+        mov rdx, 21;                            // ues_msg_usage_len
+        mov rax, 1;                             // sys_write
+        syscall;
+        mov rdi, 2;                             // exit status = 2 (usage)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      ues_setup_fail:
+        mov rdi, 2;
+        lea rsi, [rip + ues_msg_setup];
+        mov rdx, 28;                            // ues_msg_setup_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 5;                             // exit status = 5 (setup)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ================================================================
+        // Server body -- socket(DGRAM) / bind(15557) / connect(back to
+        // 15556) / recv one datagram / send it back / shutdown / exit(0).
+        // ================================================================
+
+      ues_server_body:
+        // ---- sys_socket(AF_INET=2, SOCK_DGRAM=2, 0). SC+ ID 87. ----
+        mov rdi, 2;                             // AF_INET
+        mov rsi, 2;                             // SOCK_DGRAM
+        xor rdx, rdx;                           // proto = 0
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl ues_setup_fail;
+        mov r15, rax;                           // r15 = fd
+
+        // ---- sys_bind(fd, 15557). SC+ ID 88. ----
+        mov rdi, r15;
+        mov rsi, 15557;                         // local_port
+        mov rax, 88;
+        syscall;
+        cmp rax, 0;
+        jl ues_setup_fail;
+
+        // ---- sys_connect(fd, 127.0.0.1, 15556). SC+ ID 91. ----
+        // Connected-UDP: no handshake, just latches the default peer
+        // (see sys_connect.pdx's KIND_UDP_SOCKET arm).
+        mov rdi, r15;
+        mov rsi, 0x7F000001;                    // 127.0.0.1
+        mov rdx, 15556;                         // remote_port (fixed client port)
+        mov rax, 91;
+        syscall;
+        cmp rax, 0;
+        jl ues_setup_fail;
+
+        // ---- Recv exactly one datagram into ues_recv_buf. SC+ ID 93. ----
+        // Single call -- see file header on why UDP must not loop here.
+        mov rdi, r15;
+        lea rsi, [rip + ues_recv_buf];
+        mov rdx, 32;
+        mov rax, 93;                            // sys_recv
+        syscall;
+        cmp rax, 0;
+        jle ues_setup_fail;
+        cmp rax, 32;
+        jne ues_setup_fail;                     // short/oversized datagram -> fail
+        mov r14, rax;                           // r14 = datagram length (== 32)
+
+        // ---- Send it back verbatim. SC+ ID 92. ----
+        mov rdi, r15;
+        lea rsi, [rip + ues_recv_buf];
+        mov rdx, r14;
+        mov rax, 92;                            // sys_send
+        syscall;
+        cmp rax, 0;
+        jle ues_setup_fail;
+
+        // ---- sys_shutdown(fd, SHUT_RDWR=2). SC+ ID 94. ----
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+
+        // ---- sys_exit(0). SC+ ID 60. ----
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+        // ================================================================
+        // Client body -- socket(DGRAM) / bind(15556) / connect(15557) /
+        // send payload / recv one datagram / byte-compare / fingerprint /
+        // shutdown / exit.
+        // ================================================================
+
+      ues_client_body:
+        // ---- sys_socket(AF_INET=2, SOCK_DGRAM=2, 0). SC+ ID 87. ----
+        mov rdi, 2;
+        mov rsi, 2;                             // SOCK_DGRAM
+        xor rdx, rdx;
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl ues_setup_fail;
+        mov r15, rax;                           // r15 = fd
+
+        // ---- sys_bind(fd, 15556). SC+ ID 88. ----
+        // Fixed local port so the server side can connect back to a
+        // known address (see file header's fixed-peer trick).
+        mov rdi, r15;
+        mov rsi, 15556;                         // local_port
+        mov rax, 88;
+        syscall;
+        cmp rax, 0;
+        jl ues_setup_fail;
+
+        // ---- sys_connect(fd, 127.0.0.1, 15557). SC+ ID 91. ----
+        mov rdi, r15;
+        mov rsi, 0x7F000001;                    // 127.0.0.1
+        mov rdx, 15557;                         // remote_port
+        mov rax, 91;
+        syscall;
+        cmp rax, 0;
+        jl ues_setup_fail;
+
+        // ---- Send the 32-byte payload. SC+ ID 92. Single call. ----
+        mov rdi, r15;
+        lea rsi, [rip + ues_payload];
+        mov rdx, 32;
+        mov rax, 92;                            // sys_send
+        syscall;
+        cmp rax, 0;
+        jle ues_setup_fail;
+        cmp rax, 32;
+        jne ues_setup_fail;                     // partial send of a 32B dgram is a kernel-side anomaly
+
+        // ---- Recv exactly one datagram. SC+ ID 93. Single call. ----
+        mov rdi, r15;
+        lea rsi, [rip + ues_recv_buf];
+        mov rdx, 32;
+        mov rax, 93;                            // sys_recv
+        syscall;
+        cmp rax, 0;
+        jle ues_setup_fail;
+        cmp rax, 32;
+        jne ues_setup_fail;
+
+        // ---- Byte-compare payload vs. received (32 bytes). ----
+        xor rcx, rcx;
+      ues_cli_cmp_loop:
+        xor rax, rax;
+        lea r10, [rip + ues_payload];
+        mov_b rax, [r10 + rcx*1];
+        xor r8, r8;
+        lea r10, [rip + ues_recv_buf];
+        mov_b r8, [r10 + rcx*1];
+        cmp rax, r8;
+        jne ues_cli_fail;
+        add rcx, 1;
+        cmp rcx, 32;
+        jl ues_cli_cmp_loop;
+
+        // ---- Match: emit "pdxsock udp-echo ok bytes=32\n" on fd 2. ----
+        mov rdi, 2;
+        lea rsi, [rip + ues_msg_ok];
+        mov rdx, 29;                            // ues_msg_ok_len
+        mov rax, 1;
+        syscall;
+        // ---- sys_shutdown(fd, SHUT_RDWR=2). SC+ ID 94. ----
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+        // ---- sys_exit(0). ----
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      ues_cli_fail:
+        // ---- Mismatch: emit "pdxsock udp-echo FAIL\n" on fd 2. ----
+        mov rdi, 2;
+        lea rsi, [rip + ues_msg_fail];
+        mov rdx, 22;                            // ues_msg_fail_len
+        mov rax, 1;
+        syscall;
+        // ---- sys_shutdown(fd, SHUT_RDWR=2). ----
+        mov rdi, r15;
+        mov rsi, 2;
+        mov rax, 94;
+        syscall;
+        // ---- sys_exit(1). ----
+        mov rdi, 1;
+        mov rax, 60;
+        syscall;
+        hlt;
+      }
+    }
+
+}

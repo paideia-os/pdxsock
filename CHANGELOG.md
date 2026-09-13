@@ -26,6 +26,93 @@ Version discipline:
 ## [Unreleased]
 
 ### Added
+- **v1.3.0 wave: real UDP client, TCP mirror server, poll-assisted
+  drain, UDP echo smoke (pdxsock#6, #10, #21; TCP mirror server is
+  NEW scope, see caveat below re: pdxsock#14).**
+
+  - **UDP client, real body (pdxsock#6, M3-001).** `-u <host> <port>`
+    no longer exits 3 via `pdxsock_udp_stub` -- R100-PREP-002 landed
+    (confirmed at `sys_socket.pdx`/`sys_connect.pdx`/`sys_send.pdx`/
+    `sys_recv.pdx`: all four dispatch on `KIND_UDP_SOCKET` after a TCP
+    resolve miss), so this shape now opens a real `SOCK_DGRAM=2`
+    socket, `sys_connect`'s it (connected-UDP, no handshake), and
+    falls into the SAME `pdxsock_pump_loop` / `pdxsock_client_close` /
+    `pdxsock_emit_session_and_exit` tail the TCP client uses. New mode
+    value `r14 == 2`; new fingerprints `pdxsock udp-client connect
+    ok\n` and `pdxsock udp-client bytes-in=<N> bytes-out=<M>\n`.
+    `--dry-run -u <host> <port>` now rejoins the honest preview writer
+    instead of the UNIMPLEMENTED refusal (pdxsock#18's gate no longer
+    applies to this mode). `-l -u <port>` (UDP server / listen)
+    remains out of scope and still exits 3.
+
+  - **TCP mirror server (filed under pdxsock#14's title; scope
+    caveat below).** New argv shape
+    `-l -m <port>`: a TCP listener (socket/bind/listen/accept,
+    fingerprint band reused verbatim from the plain `-l` server) whose
+    pump (`pdxsock_mirror_loop`) `sys_recv`'s the accepted connection
+    and `sys_send`'s the SAME bytes straight back, never touching
+    stdin/stdout. New mode value `r14 == 4`; new close-tail prefix
+    `pdxsock tcp-mirror bytes-in=<N> bytes-out=<M>\n`. `--dry-run
+    -l -m <port>` prints the normal `mode=tcp-mirror target=0.0.0.0:<P>`
+    preview. This turns pdxsock into its own echo fixture, unblocking
+    the UDP echo smoke below without a separate dual-role harness.
+
+    **Scope caveat:** `design/networking/r100-user-tools-plan.md`
+    §13.6 lists "M5-002 mirror push" as an IDENTICAL one-line bullet
+    across `pdxping`, `pdxdig`, AND `pdxsock`'s M5 (release)
+    milestones -- alongside M5-001's "dual-signed manifest.pdxsig +
+    CHANGELOG-1.0 + .pdxdoc" and STATUS.md's own M5-002 description
+    ("push to `https://pkgs.paideia-os/main/pdxsock/1.2.0/`... blocked
+    on the actual dual-sign pass... out-of-repo custody"). A byte-echo
+    socket mode would not make sense for pdxping (ICMP) or pdxdig
+    (DNS), so "mirror push" almost certainly names a RELEASE-ARTIFACT
+    mirror-publish step common to every R100 tool, not a per-tool
+    runtime feature -- and that release-push step remains untouched
+    (still blocked on live signing-key custody, as STATUS.md already
+    documents). The TCP mirror server above is a genuinely useful NEW
+    feature that happens to satisfy pdxsock#14's bare GitHub title
+    ("mirror push") and directly unblocks the UDP echo smoke, but it
+    should not be read as closing the release-mirror-push milestone.
+    Recommend confirming with whoever scoped pdxsock#14 whether to
+    keep it under that issue number or re-file the socket feature
+    under a new one, leaving #14 for the actual release push.
+
+  - **Non-blocking socket-readiness drain for the TCP/UDP client pump
+    (pdxsock#21).** Investigation finding: `sys_poll`'s
+    `poll_socket_readiness` (`sys_poll.pdx`) resolves ONLY
+    `KIND_TCP_SOCKET`/`KIND_TCP_LISTENER`/`KIND_UDP_SOCKET` fds --
+    stdin (fd 0) always reports `revents == 0` and can NEVER be
+    observed ready, so the issue's literal ask ("multiplex fd 0 and
+    the socket fd via sys_poll") is not buildable on the current
+    kernel surface, independent of the TCP-RX-wake caveat this file
+    previously cited. What lands instead: a non-blocking
+    `sys_poll(timeout_ms=0)` on the socket fd ONLY, issued at the top
+    of every pump-loop iteration (client and udp-client modes) before
+    the stdin read -- if the socket already has bytes queued they are
+    drained (recv+write, looping back through the same check) before
+    stdin is touched. Closes the "peer replies while we sit in a
+    stale blocking stdin read" gap without claiming concurrency
+    `sys_poll` cannot deliver. Genuine concurrent full-duplex remains
+    blocked pending a kernel-side fix (a non-socket-fd arm on
+    `poll_socket_readiness`, or a non-blocking `sys_read` surface) --
+    recommended as a paideia-os follow-up rather than a pdxsock
+    re-scope.
+
+  - **UDP echo round-trip smoke (pdxsock#10, M4-002).** Adds
+    `tests/udp_echo_smoke.pdx` (module `UdpEchoSmoke`), structural
+    sibling of `tests/tcp_echo_smoke.pdx`: a dual-role ELF where both
+    roles bind a FIXED local port (client 15556, server 15557) before
+    `sys_connect`-ing to each other's fixed port, sidestepping the
+    need for `sys_recvfrom`'s peer-discovery out-params. Single-call
+    (not loop-until-N) send/recv, honoring UDP's datagram-boundary
+    semantics -- unlike the TCP smoke's partial-completion retry
+    loops. Fingerprint `pdxsock udp-echo ok bytes=32\n` / `... FAIL\n`
+    / `... setup fail\n`; same 0/1/2/5 exit-code taxonomy as
+    `tests/tcp_echo_smoke.pdx`.
+
+  `caps.decl` and `README.md` updated to drop stale "stub"/"blocked on
+  R100-PREP-002" language for the UDP client and document `-m`.
+
 - **Server-refuses-second-connection smoke witness (pdxsock#11,
   M4-003).** Adds `tests/m4_003_server_refuses_second.pdx` (module
   `M4003ServerRefusesSecond`) as a three-role ELF driven by

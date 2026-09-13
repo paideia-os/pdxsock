@@ -226,15 +226,88 @@
 // accept refusals, argv usage, bad port, bad ip) emit nothing -- there
 // is no session to describe.
 //
-// UDP client + UDP server + --dry-run + stdin/socket full-duplex are
-// DEFERRED to later issues on the pdxsock backlog:
-//   - -u UDP client: pdxsock#6 (M3-001), unblocked by sysnos 96/97
-//     (sendto/recvfrom, R93.M2-004 #2052). This body prints the
-//     documented pdxsock_msg_udp_not_yet diagnostic and exits 3.
+// v1.3.0 "UDP client real body + poll-assisted TCP drain + mirror
+// server" scope (issues #6, #21, #14)
+// -----------------------------------------------------------------
+//
+// UDP client (pdxsock#6, M3-001): R100-PREP-002 landed (confirmed at
+// src/kernel/core/syscall/handlers/sys_socket.pdx / sys_connect.pdx /
+// sys_send.pdx / sys_recv.pdx -- all four now dispatch on
+// KIND_UDP_SOCKET (0x1A8) after a KIND_TCP_SOCKET resolve miss, and
+// design/round-retrospectives/r93-closure.md + r95-closed.md confirm
+// the landing). `-u <host> <port>` therefore retires the exit-3 stub:
+// it opens a real SOCK_DGRAM=2 socket, sys_connect's it (connected-UDP
+// -- no handshake, kernel-side just latches the default peer), and
+// falls into the SAME `pdxsock_pump_loop` / `pdxsock_client_close` /
+// `pdxsock_emit_session_and_exit` tail the TCP client uses -- sys_send
+// / sys_recv / sys_shutdown (SC+ 92/93/94) are byte-identical calls on
+// a connected-UDP fd. Mode encoding gains r14 == 2 (udp-client);
+// fingerprints get udp-client-flavoured siblings (`pdxsock udp-client
+// connect ok`, `pdxsock udp-client bytes-in=<N> bytes-out=<M>`) so a
+// caller can distinguish the transport from the TCP client's band.
+// `-l -u <port>` (UDP server / listen) remains OUT OF SCOPE and still
+// hits `pdxsock_udp_stub` (exit 3) -- a bound-not-connected UDP
+// listener needs sys_recvfrom's peer-address out-params (SC+ 97) to
+// learn who to reply to, which this landing does not wire into the
+// generic `-l` path (the mirror server below sidesteps this by
+// requiring a FIXED, pre-known peer -- see pdxsock#14 below).
+//
+// TCP full-duplex forwarding (pdxsock#21): the issue asked for
+// sys_poll (SC+ 102) to multiplex fd 0 (stdin) and the socket fd so a
+// peer's unprompted push does not sit behind a blocking sys_read(0).
+// INVESTIGATION FINDING (important scope correction): sys_poll's
+// readiness function (`poll_socket_readiness` in
+// src/kernel/core/syscall/handlers/sys_poll.pdx) resolves the polled
+// fd ONLY against KIND_TCP_SOCKET / KIND_TCP_LISTENER / KIND_UDP_SOCKET;
+// any other fd (stdin included) falls through to `xor rax, rax` --
+// "POLLNVAL deferred" -- and NEVER reports ready. sys_poll therefore
+// cannot multiplex fd 0 at all; a poll array containing {fd:0,
+// events:POLLIN} would report revents=0 forever, so a design built on
+// "block in sys_poll across both fds" cannot be built on today's
+// kernel surface regardless of the TCP-RX-wake caveat this file
+// previously cited. What IS achievable, and what this landing does:
+// a non-blocking sys_poll(timeout_ms=0) on the SOCKET FD ONLY, issued
+// at the top of every pump-loop iteration BEFORE the stdin read. If
+// the socket already has bytes queued, they are drained and forwarded
+// to stdout immediately (a tight drain loop that keeps polling+
+// recv+write until the socket goes non-ready), so a peer's push
+// arriving while we are between iterations is not held hostage behind
+// a fresh blocking stdin read. This closes the most common half-duplex
+// gap (server replies promptly to something already sent) without
+// claiming concurrency sys_poll cannot deliver. Genuine concurrent
+// full-duplex (a peer push arriving WHILE sys_read(0) is already
+// blocked) remains impossible until either (a) poll_socket_readiness
+// grows a non-socket-fd arm, or (b) a non-blocking sys_read /
+// O_NONBLOCK surface exists. Recommend filing that as a paideia-os
+// kernel-side follow-up rather than re-scoping pdxsock further.
+//
+// Mirror server (pdxsock#14, M5-002): `-l -m <port>` is a NEW argv
+// shape -- a TCP listen server whose body is socket+bind+listen+
+// accept (identical setup to the plain `-l` server) but whose pump is
+// `pdxsock_mirror_loop`, not the stdin<->socket relay: every chunk
+// `sys_recv`'d from the accepted connection is `sys_send`'d straight
+// back to the SAME fd, verbatim, byte-for-byte, and stdin/stdout are
+// never touched for payload. This turns pdxsock into its own echo
+// fixture -- exactly what pdxsock#10's UDP echo smoke and the existing
+// M4-001 TCP echo smoke both needed and previously had to hand-roll as
+// a separate dual-role test ELF (tests/tcp_echo_smoke.pdx's file
+// header explains why: "pdxsock's server body is a stdin<->socket /
+// socket<->stdout relay, NOT a socket<->socket echo"). Mode encoding
+// gains r14 == 4 (tcp-mirror); its fingerprint band mirrors the plain
+// server's (`pdxsock tcp-server listening/accept ok ...`, reused
+// verbatim -- only the close-tail prefix ("pdxsock tcp-mirror
+// bytes-in=...") and payload direction differ).
+//
+// UDP client + UDP server + --dry-run history (superseded bullets
+// retained for context; see the v1.3.0 block above for the current
+// state):
 //   - -u -l UDP server: out of scope per design/networking/r100-user-
 //     tools-plan.md §7.2 (needs recvfrom peer-address out-params which
 //     the caller-side ABI at this round does not thread through libpdx-
-//     net yet; UDP server would need a different tool shape).
+//     net yet; UDP server would need a different tool shape). STILL
+//     true at v1.3.0 for the generic `-l -u` path; the mirror server
+//     sidesteps it by fixing the peer ahead of time instead of
+//     discovering it via recvfrom.
 //   - --dry-run: LANDED as an [Unreleased] change on top of v1.2.0
 //     (pdxsock#3, M1-003). Leading-position `--dry-run` at argv[1]
 //     is peeled at _start Step 0.5 and the flow enters the dedicated
@@ -243,29 +316,26 @@
 //     sys_exit(0) without opening any socket. Positional-flexibility
 //     (--dry-run at any argv index) deferred -- may be subsumed by
 //     the M1-002 argv scanner move (pdxsock#2). v1.2.2 hotfix
-//     (pdxsock#18): dry-run now refuses to fabricate a runnable-
-//     looking preview for a mode whose real-run body is STUB (exit
-//     3). At this release that gates udp-client and udp-server:
-//     both dry-run classifier arms jump to `pdxsock_dry_udp_refuse`
-//     which composes the honest refusal line
-//       `pdxsock dry-run mode=udp-<x> UNIMPLEMENTED\n`
-//     on fd 1 and sys_exit(3) -- matching `pdxsock_udp_stub`'s exit
-//     code exactly. TCP-client / TCP-server dry-run behaviour is
-//     bit-for-bit unchanged (their real-run bodies do open sockets
-//     and complete, so the friendly preview stays honest for those
-//     shapes).
+//     (pdxsock#18): dry-run refuses to fabricate a runnable-looking
+//     preview for a mode whose real-run body is STUB (exit 3). At
+//     v1.3.0 this still gates udp-server (`-l -u`, real-run still
+//     STUB) but NO LONGER gates udp-client (`-u <host> <port>`,
+//     real-run is now a genuine connected-UDP session) -- its dry-run
+//     classifier rejoins the normal preview writer (`pdxsock_dry_
+//     print`) instead of `pdxsock_dry_udp_refuse`.
 //   - Bidirectional stdin/socket forwarding: LANDED at v1.1-A'
 //     (pdxsock#4, M2-001) as blocking-alternation over sys_read(0)
-//     and sys_recv(fd). See the v1.1-A' scope block above for the
-//     "why blocking-alternation instead of sys_poll" note; true
-//     full-duplex (concurrent stdin+socket traffic) re-lands once
-//     TCP RX wake or a non-blocking sys_read on stdin exists.
+//     and sys_recv(fd); gained the non-blocking socket-side poll-
+//     drain pass at v1.3.0 (pdxsock#21, see above). True concurrent
+//     full-duplex remains blocked on a kernel-side sys_poll gap (see
+//     above).
 //
 // Argv grammar accepted at this landing (matches design §7.1 subset):
 //     pdxsock <host> <port>       -- TCP client
 //     pdxsock -l <port>           -- TCP server
-//     pdxsock -u <host> <port>    -- UDP client (STUB refuses; exit 3)
+//     pdxsock -u <host> <port>    -- UDP client (real, connected-UDP)
 //     pdxsock -l -u <port>        -- UDP server (out of scope; exit 3)
+//     pdxsock -l -m <port>        -- TCP mirror server (echoes rx back)
 //     pdxsock                     -- usage on fd 2; exit 2
 //     pdxsock <anything else>     -- usage on fd 2; exit 2
 //
@@ -304,6 +374,7 @@
 //   92  = sys_send          (fd, buf, len)           -> n | -errno
 //   93  = sys_recv          (fd, buf, len)           -> n | -errno
 //   94  = sys_shutdown      (fd, how)                -> 0 | -errno
+//   102 = sys_poll          (pollfd_ptr, nfds, timeout_ms) -> nready | -errno (v1.3.0)
 //   115 = sys_semantic_send (schema, rec_ptr, rec_len) -> 0 | -errno   (v1.1-B)
 //
 // The kernel's real bind/connect ABI is the "collapsed" shape
@@ -395,6 +466,10 @@ module Main = structure {
   pub let pdxsock_msg_mode_tcp_server  : [u8; 11] = "tcp-server\0"
   pub let pdxsock_msg_mode_udp_client  : [u8; 11] = "udp-client\0"
   pub let pdxsock_msg_mode_udp_server  : [u8; 11] = "udp-server\0"
+  // v1.3.0 (pdxsock#14): tcp-mirror dry-run preview literal. Same
+  // 10-byte wire width as the other four mode names, so it shares
+  // pdxsock_msg_mode_name_len without a separate length constant.
+  pub let pdxsock_msg_mode_tcp_mirror  : [u8; 11] = "tcp-mirror\0"
   pub let pdxsock_msg_mode_name_len    : u64      = 10
 
   pub let pdxsock_msg_target_kw        : [u8; 9]  = " target=\0"
@@ -471,8 +546,26 @@ module Main = structure {
   pub let pdxsock_msg_connect_ok       : [u8; 31] = "pdxsock tcp-client connect ok\n\0"
   pub let pdxsock_msg_connect_ok_len   : u64      = 30
 
+  // v1.3.0 (pdxsock#6, M3-001): udp-client sibling of the TCP
+  // connect-ok fingerprint. Same wire length (30 bytes -- "tcp" and
+  // "udp" are both 3 chars) so the shared `mov rdx, 30` write needs
+  // no branch on length, only on which literal to point rsi at.
+  pub let pdxsock_msg_connect_ok_udp     : [u8; 31] = "pdxsock udp-client connect ok\n\0"
+  pub let pdxsock_msg_connect_ok_udp_len : u64      = 30
+
   pub let pdxsock_msg_close_prefix     : [u8; 29] = "pdxsock tcp-client bytes-in=\0"
   pub let pdxsock_msg_close_prefix_len : u64      = 28
+
+  // v1.3.0 (pdxsock#6 udp-client, pdxsock#14 tcp-mirror): both
+  // siblings of pdxsock_msg_close_prefix, same 28-byte wire length
+  // ("udp-client" / "tcp-mirror" are both 10 chars, same as
+  // "tcp-client" / "tcp-server") so pdxsock_client_close's shared
+  // `mov rdx, 28; syscall` stays branch-free on length.
+  pub let pdxsock_msg_close_prefix_udp     : [u8; 29] = "pdxsock udp-client bytes-in=\0"
+  pub let pdxsock_msg_close_prefix_udp_len : u64      = 28
+
+  pub let pdxsock_msg_close_prefix_mirror     : [u8; 29] = "pdxsock tcp-mirror bytes-in=\0"
+  pub let pdxsock_msg_close_prefix_mirror_len : u64      = 28
 
   pub let pdxsock_msg_close_mid        : [u8; 12] = " bytes-out=\0"
   pub let pdxsock_msg_close_mid_len    : u64      = 11
@@ -632,6 +725,19 @@ module Main = structure {
   pub let mut pdxsock_dec_scratch_out    : [u8; 20] = uninit @align(8)
 
   // -----------------------------------------------------------------
+  // v1.3.0 (pdxsock#21): single-entry pollfd scratch for the pump
+  // loop's non-blocking socket-readiness check. Layout is the kernel's
+  // Linux-compatible `pollfd` (src/kernel/core/syscall/handlers/
+  // sys_poll.pdx header): +0 fd:i32, +4 events:u16, +6 revents:u16,
+  // 8 bytes total. One entry only (nfds=1) -- this file never polls
+  // more than the single connection fd (stdin/fd 0 cannot be polled
+  // at all; see the file-header v1.3.0 sys_poll investigation note).
+  // .bss, uninit (every field is written fresh before each sys_poll
+  // call), 8-byte aligned so the whole struct is one aligned qword.
+  // -----------------------------------------------------------------
+  pub let mut pdxsock_pollfd : [u8; 8] = uninit @align(8)
+
+  // -----------------------------------------------------------------
   // _start -- pdxsock entry point. Never returns; every terminal path
   // ends in sys_exit.
   //
@@ -640,7 +746,11 @@ module Main = structure {
   // amd64 fast-syscall convention):
   //   r12 = argc     (Step 0..argv parse) then bytes_in accumulator (v1.1-B)
   //   r13 = argv base (Step 0..argv parse) then bytes_out accumulator (v1.1-B)
-  //   r14 = mode flag                  (0=client, 1=server, 2=UDP-client stub)
+  //   r14 = mode flag                  (0=tcp-client, 1=tcp-server,
+  //                                     2=udp-client, 4=tcp-mirror-server;
+  //                                     3 is reserved for udp-server, still
+  //                                     out of scope, never reaches _start's
+  //                                     socket-side r14 -- see pdxsock_udp_stub)
   //   r15 = fd                         (from sys_socket / sys_accept)
   //   rbx = parsed port                (0..65535); also carried into the
   //                                     v1.1-B emit record
@@ -658,7 +768,10 @@ module Main = structure {
   // Exit statuses:
   //   0 = clean completion (a normal end-of-stream on either side)
   //   2 = argv usage refusal
-  //   3 = capability not yet wired at v1.1-A (UDP stub)
+  //   3 = UDP server (`-l -u`) is still out of scope at v1.3.0
+  //       (pdxsock_udp_stub); UDP client (`-u <host> <port>`) no
+  //       longer exits 3 as of v1.3.0 pdxsock#6 -- it is a real
+  //       connected-UDP session now
   //   4 = sys_socket refused
   //   5 = sys_connect refused (client) / sys_bind refused (server)
   //   6 = sys_listen refused
@@ -791,8 +904,10 @@ module Main = structure {
         jmp pdxsock_parse_port;
 
       pdxsock_check_argc4:
-        // argc == 4: `pdxsock -u <host> <port>` (UDP client stub) or
-        //            `pdxsock -l -u <port>` (UDP server refusal).
+        // argc == 4: `pdxsock -u <host> <port>` (real UDP client,
+        //            v1.3.0 pdxsock#6), `pdxsock -l -u <port>` (UDP
+        //            server refusal), or `pdxsock -l -m <port>` (TCP
+        //            mirror server, v1.3.0 pdxsock#14).
         // Peek argv[1]: '-l' or '-u'?
         mov rbx, [r13 + 8];                    // rbx = argv[1]
         xor rax, rax;
@@ -813,8 +928,17 @@ module Main = structure {
         mov_b rax, [rbx + 2];
         cmp rax, 0;
         jne pdxsock_usage;
-        // UDP client stub -- emit diagnostic and exit 3 (no socket touched).
-        jmp pdxsock_udp_stub;
+        // v1.3.0 (pdxsock#6, M3-001): real UDP client. Shift argv by
+        // one slot so the shared IP/port parser sees host at the
+        // "effective argv[1]" position and port at "effective argv[2]"
+        // -- exactly the layout pdxsock_client_parse_ip and
+        // pdxsock_parse_port already expect for the plain TCP client.
+        // Symmetric to the Step 0.5 --dry-run peel (`add r13, 8`); the
+        // pre-shift argv is never referenced again on this path.
+        mov r14, 2;                              // mode = 2 (udp-client)
+        add r13, 8;                              // skip "-u": argv[2]->eff[1], argv[3]->eff[2]
+        mov rdi, [r13 + 16];                     // port_str = eff argv[2] (orig argv[3])
+        jmp pdxsock_parse_port;
 
       pdxsock_argv4_l:
         // "-l ..." at argv[1]. Ensure NUL after 'l'.
@@ -822,7 +946,8 @@ module Main = structure {
         mov_b rax, [rbx + 2];
         cmp rax, 0;
         jne pdxsock_usage;
-        // Peek argv[2]: expect "-u" for the UDP server refusal path.
+        // Peek argv[2]: "-u" (UDP server refusal) or "-m" (v1.3.0
+        // pdxsock#14 TCP mirror server).
         mov rbx, [r13 + 16];
         xor rax, rax;
         mov_b rax, [rbx];
@@ -830,16 +955,35 @@ module Main = structure {
         jne pdxsock_usage;
         xor rax, rax;
         mov_b rax, [rbx + 1];
-        cmp rax, 0x75;
-        jne pdxsock_usage;
+        cmp rax, 0x75;                           // 'u'
+        je pdxsock_argv4_lu;
+        cmp rax, 0x6d;                           // 'm'
+        je pdxsock_argv4_lm;
+        jmp pdxsock_usage;
+
+      pdxsock_argv4_lu:
         xor rax, rax;
         mov_b rax, [rbx + 2];
         cmp rax, 0;
         jne pdxsock_usage;
-        // "-l -u <port>" -- UDP server. Out of scope per §7.2. Same
-        // diagnostic + exit 3 as the UDP client stub (both are the
-        // "UDP not yet wired at v1.1-A" surface).
+        // "-l -u <port>" -- UDP server. Out of scope per §7.2 (needs
+        // sys_recvfrom's peer-address out-params, not wired into the
+        // generic `-l` path at v1.3.0 -- see pdxsock_mirror_server_body
+        // below for the fixed-peer sidestep the mirror server uses
+        // instead). Same diagnostic + exit 3 as originally landed.
         jmp pdxsock_udp_stub;
+
+      pdxsock_argv4_lm:
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0;
+        jne pdxsock_usage;
+        // "-l -m <port>" -- v1.3.0 (pdxsock#14, M5-002) TCP mirror
+        // server. Port is argv[3]; mode is picked AFTER port parsing
+        // (pdxsock_port_done) since the parser itself is mode-agnostic.
+        mov r14, 4;                              // mode = 4 (tcp-mirror)
+        mov rdi, [r13 + 24];                     // port_str = argv[3]
+        jmp pdxsock_parse_port;
 
       pdxsock_client_mode:
         // argc == 3 with no leading flag: `pdxsock <host> <port>`.
@@ -990,9 +1134,18 @@ module Main = structure {
         // Fork on mode.
         cmp r14, 1;
         je pdxsock_server_body;
+        cmp r14, 4;
+        je pdxsock_mirror_server_body;           // v1.3.0 (pdxsock#14)
+        // r14 == 0 (tcp-client) or r14 == 2 (udp-client, v1.3.0
+        // pdxsock#6): both need the host string parsed, then fork
+        // again on socket type inside pdxsock_client_body.
         cmp r14, 0;
         je pdxsock_client_parse_ip;
-        // Unreachable (mode==2 was consumed by pdxsock_udp_stub above).
+        cmp r14, 2;
+        je pdxsock_client_parse_ip;
+        // Unreachable (every mode value this parser can see is
+        // handled above; mode==3/udp-server never reaches the port
+        // parser -- pdxsock_udp_stub short-circuits before it).
         jmp pdxsock_usage;
 
         // ================================================================
@@ -1069,9 +1222,21 @@ module Main = structure {
         // ================================================================
 
       pdxsock_client_body:
-        // ---- sys_socket(AF_INET=2, SOCK_STREAM=1, 0). SC+ ID 87. ----
+        // ---- sys_socket(AF_INET=2, type, 0). SC+ ID 87. ----
+        //
+        // v1.3.0 (pdxsock#6): type is mode-picked. r14 == 2 (udp-
+        // client) -> SOCK_DGRAM=2; every other reachable mode here
+        // (r14 == 0, tcp-client) -> SOCK_STREAM=1, the pre-v1.3.0
+        // default. sys_connect / sys_send / sys_recv below are the
+        // SAME calls regardless of type -- the kernel dispatches on
+        // the fd's KIND (stamped by this sys_socket call), not on any
+        // type tag this file threads through.
         mov rdi, 2;                              // AF_INET
-        mov rsi, 1;                              // SOCK_STREAM
+        mov rsi, 1;                              // SOCK_STREAM (default)
+        cmp r14, 2;
+        jne pdxsock_client_socktype_set;
+        mov rsi, 2;                              // SOCK_DGRAM (udp-client)
+      pdxsock_client_socktype_set:
         xor rdx, rdx;                            // proto = 0
         mov rax, 87;
         syscall;
@@ -1102,9 +1267,17 @@ module Main = structure {
         // wait for the pump loop's first EOF -- a run that connects and
         // then blocks on stdin forever (e.g. interactive netcat-shaped
         // use) still surfaces the connect-ok proof of life.
+        // v1.3.0 (pdxsock#6): pick the udp-client fingerprint sibling
+        // when r14 == 2; every other reachable mode here (r14 == 0)
+        // keeps the original tcp-client literal. Both are 30 wire
+        // bytes so the shared `mov rdx, 30` needs no branch on length.
         mov rdi, 2;                              // fd = stderr
         lea rsi, [rip + pdxsock_msg_connect_ok];
-        mov rdx, 30;                             // pdxsock_msg_connect_ok_len
+        cmp r14, 2;
+        jne pdxsock_connect_ok_write;
+        lea rsi, [rip + pdxsock_msg_connect_ok_udp];
+      pdxsock_connect_ok_write:
+        mov rdx, 30;                             // pdxsock_msg_connect_ok_len (shared)
         mov rax, 1;                              // sys_write
         syscall;
 
@@ -1157,7 +1330,11 @@ module Main = structure {
         // wire.pdx module header).
         mov rdi, rbp;                            // peer_ip (u32-in-u64)
         mov rsi, rbx;                            // peer_port (u16-in-u64)
-        xor rdx, rdx;                            // mode = 0 (tcp-client)
+        xor rdx, rdx;                            // mode = 0 (tcp-client, default)
+        cmp r14, 2;
+        jne pdxsock_audit_mode_set;
+        mov rdx, 2;                              // mode = 2 (udp-client, v1.3.0 pdxsock#6)
+      pdxsock_audit_mode_set:
         call pdxsock_audit_session_start;
 
         // v1.1-A' (issue #4, M2-001) bidirectional pump.
@@ -1232,6 +1409,70 @@ module Main = structure {
         // header note on the client-mode blocking-alternation choice.
         cmp r14, 1;
         je pdxsock_pump_recv;
+
+        // ---- Step 0.6 (v1.3.0, pdxsock#21): non-blocking socket-
+        // readiness drain BEFORE touching stdin. ----
+        //
+        // sys_poll (SC+ 102) on the CONNECTION fd only, timeout_ms=0
+        // (non-blocking short poll -- see sys_poll.pdx: "nready > 0 OR
+        // timeout_ms == 0" always returns immediately without
+        // sched_block, so this needs none of the deferred TCP-RX-wake
+        // wire). fd 0 (stdin) is deliberately NOT in this pollfd array
+        // -- src/kernel/core/syscall/handlers/sys_poll.pdx's
+        // `poll_socket_readiness` resolves only KIND_TCP_SOCKET /
+        // KIND_TCP_LISTENER / KIND_UDP_SOCKET fds; any other fd falls
+        // through to its `xor rax, rax` arm (POLLNVAL deferred) and
+        // NEVER reports ready, so including fd 0 here would just be
+        // dead weight -- it can never contribute to nready.
+        //
+        // If the socket already has bytes queued (rax > 0), jump into
+        // `pdxsock_pump_recv` -- the SAME recv+write body the server
+        // path uses -- which ends in `jmp pdxsock_pump_loop`, landing
+        // back at this exact poll check. That loop-back is the drain:
+        // repeated iterations keep recv+write-ing (and re-polling)
+        // until the socket goes quiet, THEN fall through to the
+        // ordinary Step 1 stdin read below. rax == 0 (not ready) or
+        // rax < 0 (poll refusal -- not fatal to the pump; the
+        // blocking stdin/recv alternation still functions without
+        // this optimisation) both fall through unchanged.
+        //
+        // pollfd struct (Linux-compatible, per sys_poll.pdx header):
+        // +0 fd:i32, +4 events:u16, +6 revents:u16 (8 bytes). Built
+        // byte-by-byte via `mov_b` (this encoder has no native 16/32-
+        // bit store) -- identical decompose-and-mask shape to
+        // sys_poll.pdx's own `poll_scan_loop` decode. r15 (fd) is
+        // read-only here; rcx/rdx/rdi/rsi/rax are freely scratched and
+        // r12/r13/r14/rbx/rbp survive (callee-save, matches every
+        // other syscall site in this pump).
+        lea rcx, [rip + pdxsock_pollfd];
+        mov rdx, r15;
+        and rdx, 0xFF;
+        mov_b [rcx + 0], rdx;
+        mov rdx, r15;
+        shr rdx, 8;
+        and rdx, 0xFF;
+        mov_b [rcx + 1], rdx;
+        mov rdx, r15;
+        shr rdx, 16;
+        and rdx, 0xFF;
+        mov_b [rcx + 2], rdx;
+        mov rdx, r15;
+        shr rdx, 24;
+        and rdx, 0xFF;
+        mov_b [rcx + 3], rdx;
+        mov rdx, 1;                              // events = POLLIN
+        mov_b [rcx + 4], rdx;
+        xor rdx, rdx;
+        mov_b [rcx + 5], rdx;                    // events high byte = 0
+        mov_b [rcx + 6], rdx;                    // revents = 0 (kernel overwrites)
+        mov_b [rcx + 7], rdx;
+        mov rdi, rcx;                            // pollfd_arr_va
+        mov rsi, 1;                              // nfds = 1
+        xor rdx, rdx;                            // timeout_ms = 0 (non-blocking)
+        mov rax, 102;                            // sys_poll
+        syscall;
+        cmp rax, 0;
+        jg pdxsock_pump_recv;                    // socket ready -> drain now
 
         // ---- Step 1: sys_read(0, buf, 4096). SC+ ID 0. ----
         xor rdi, rdi;                            // fd = 0 (stdin)
@@ -1348,13 +1589,28 @@ module Main = structure {
         // The mid string (" bytes-out="), scratches, digit encoder,
         // and terminal newline are reused verbatim -- only the
         // prefix pointer differs by mode.
+        // v1.3.0 (pdxsock#6 udp-client, pdxsock#14 tcp-mirror): prefix
+        // pick extended to four modes. All four prefix literals are
+        // exactly 28 wire bytes (see each pdxsock_msg_close_prefix*
+        // declaration) so the shared `mov rdx, 28; syscall` still
+        // needs no branch on length, only on which pointer rsi holds.
         mov rdi, 2;                              // fd = stderr
-        lea rsi, [rip + pdxsock_msg_close_prefix];
+        lea rsi, [rip + pdxsock_msg_close_prefix];      // default: r14 == 0
         cmp r14, 0;
         je pdxsock_srv_close_prefix_write;
-        lea rsi, [rip + pdxsock_msg_close_prefix_srv];
+        cmp r14, 2;
+        je pdxsock_close_prefix_udp;
+        cmp r14, 4;
+        je pdxsock_close_prefix_mirror;
+        lea rsi, [rip + pdxsock_msg_close_prefix_srv];  // r14 == 1
+        jmp pdxsock_srv_close_prefix_write;
+      pdxsock_close_prefix_udp:
+        lea rsi, [rip + pdxsock_msg_close_prefix_udp];
+        jmp pdxsock_srv_close_prefix_write;
+      pdxsock_close_prefix_mirror:
+        lea rsi, [rip + pdxsock_msg_close_prefix_mirror];
       pdxsock_srv_close_prefix_write:
-        mov rdx, 28;                             // shared client/server _len
+        mov rdx, 28;                             // shared across all four prefixes
         mov rax, 1;
         syscall;
 
@@ -1759,6 +2015,233 @@ module Main = structure {
         jmp pdxsock_pump_loop;
 
         // ================================================================
+        // TCP mirror server -- v1.3.0 (pdxsock#14, M5-002).
+        //
+        //   Entry:  rbx = parsed port (0..65535), r14 = 4.
+        //   Setup:  byte-for-byte identical to pdxsock_server_body
+        //           (socket/bind/listen/accept over sysnos 87/88/89/90;
+        //           same "-l" fingerprint band on fd 2 -- a mirror
+        //           server is still an ordinary TCP listener from the
+        //           outside, the only difference is what happens to
+        //           bytes AFTER accept). Duplicated rather than shared
+        //           via a jump-into-the-middle because the fingerprint
+        //           band's diagnostic-failure labels (pdxsock_socket_
+        //           fail et al) are unconditional jumps reachable from
+        //           either body -- sharing the setup code would need a
+        //           second register to remember "which pump to enter
+        //           after accept", which is exactly what r14 already
+        //           encodes at the fork in pdxsock_port_done. A future
+        //           refactor (pdxsock's argv-scanner-move milestone)
+        //           may fold this into one parameterised body once the
+        //           file gains real callable functions.
+        //   Pump:   `pdxsock_mirror_loop` -- sys_recv the accepted fd,
+        //           sys_send the SAME bytes back to the SAME fd,
+        //           repeat. Stdin/stdout are never touched for payload
+        //           (this is a socket<->socket echo, not a stdin<->
+        //           socket relay) -- exactly the fixture shape pdxsock
+        //           #10's UDP echo smoke and the pre-existing TCP
+        //           echo smoke (tests/tcp_echo_smoke.pdx) both had to
+        //           hand-roll as separate dual-role test ELFs because
+        //           pdxsock's ordinary server body cannot loop bytes
+        //           back without external stdout->stdin plumbing.
+        //   Close:  falls into `pdxsock_client_close` (r14 == 4 picks
+        //           the "pdxsock tcp-mirror bytes-in=" prefix) then
+        //           the shared semantic-pipe emit tail, identical to
+        //           every other mode.
+        // ================================================================
+
+      pdxsock_mirror_server_body:
+        // ---- sys_socket(AF_INET=2, SOCK_STREAM=1, 0). SC+ ID 87. ----
+        mov rdi, 2;
+        mov rsi, 1;
+        xor rdx, rdx;
+        mov rax, 87;
+        syscall;
+        cmp rax, 0;
+        jl pdxsock_socket_fail;
+        mov r15, rax;                            // r15 = listen fd
+
+        // ---- sys_bind(fd, port). SC+ ID 88. ----
+        mov rdi, r15;
+        mov rsi, rbx;
+        mov rax, 88;
+        syscall;
+        cmp rax, 0;
+        jl pdxsock_bind_fail;
+
+        // ---- sys_listen(fd, 1). SC+ ID 89. ----
+        mov rdi, r15;
+        mov rsi, 1;
+        mov rax, 89;
+        syscall;
+        cmp rax, 0;
+        jl pdxsock_listen_fail;
+
+        // Fingerprint: "pdxsock tcp-server listening ok port=<P>\n"
+        // (reused verbatim -- a mirror server is still a TCP listener
+        // from a caller's point of view; only the pump differs).
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_srv_listen_pre];
+        mov rdx, 37;                             // pdxsock_msg_srv_listen_pre_len
+        mov rax, 1;
+        syscall;
+
+        mov r9, rbx;
+        lea r11, [rip + pdxsock_dec_scratch_in];
+        add r11, 19;
+        cmp r9, 0;
+        jne pdxsock_mirror_port_dec_loop;
+          mov al, 0x30;
+          mov [r11], al;
+          mov rdi, 2;
+          mov rsi, r11;
+          mov rdx, 1;
+          mov rax, 1;
+          syscall;
+          jmp pdxsock_mirror_port_dec_done;
+
+      pdxsock_mirror_port_dec_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;
+        div rcx;
+        add rdx, 0x30;
+        mov [r11], dl;
+        mov r9, rax;
+        cmp r9, 0;
+        je pdxsock_mirror_port_dec_emit;
+        sub r11, 1;
+        jmp pdxsock_mirror_port_dec_loop;
+
+      pdxsock_mirror_port_dec_emit:
+        mov rdi, 2;
+        mov rsi, r11;
+        lea rax, [rip + pdxsock_dec_scratch_in];
+        add rax, 20;
+        sub rax, r11;
+        mov rdx, rax;
+        mov rax, 1;
+        syscall;
+
+      pdxsock_mirror_port_dec_done:
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_newline];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+
+        // ---- sys_accept(fd). SC+ ID 90. Blocks. ----
+        mov rdi, r15;
+        mov rax, 90;
+        syscall;
+        cmp rax, 0;
+        jl pdxsock_accept_fail;
+        mov r15, rax;                            // r15 = accepted fd
+
+        // Fingerprint: "pdxsock tcp-server accept ok fd=<N>\n" (reused
+        // verbatim, same rationale as the listening-ok fingerprint).
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_srv_accept_pre];
+        mov rdx, 32;                             // pdxsock_msg_srv_accept_pre_len
+        mov rax, 1;
+        syscall;
+
+        mov r9, r15;
+        lea r11, [rip + pdxsock_dec_scratch_in];
+        add r11, 19;
+        cmp r9, 0;
+        jne pdxsock_mirror_fd_dec_loop;
+          mov al, 0x30;
+          mov [r11], al;
+          mov rdi, 2;
+          mov rsi, r11;
+          mov rdx, 1;
+          mov rax, 1;
+          syscall;
+          jmp pdxsock_mirror_fd_dec_done;
+
+      pdxsock_mirror_fd_dec_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;
+        div rcx;
+        add rdx, 0x30;
+        mov [r11], dl;
+        mov r9, rax;
+        cmp r9, 0;
+        je pdxsock_mirror_fd_dec_emit;
+        sub r11, 1;
+        jmp pdxsock_mirror_fd_dec_loop;
+
+      pdxsock_mirror_fd_dec_emit:
+        mov rdi, 2;
+        mov rsi, r11;
+        lea rax, [rip + pdxsock_dec_scratch_in];
+        add rax, 20;
+        sub rax, r11;
+        mov rdx, rax;
+        mov rax, 1;
+        syscall;
+
+      pdxsock_mirror_fd_dec_done:
+        mov rdi, 2;
+        lea rsi, [rip + pdxsock_msg_newline];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+
+        // Session accounting + audit hook, symmetric to the plain
+        // server body. mode = 4 (tcp-mirror) distinguishes the audit
+        // record from a plain tcp-server session (STUB no-ops either
+        // way; the value is future-facing documentation).
+        xor rbp, rbp;                            // peer_ip = 0 (accept MVP)
+        xor r12, r12;                            // bytes_in  = 0
+        xor r13, r13;                            // bytes_out = 0
+        rdtsc;
+        shl rdx, 32;
+        or rax, rdx;
+        mov [rip + pdxsock_session_start_ns], rax;
+
+        xor rdi, rdi;                            // peer_ip = 0
+        xor rsi, rsi;                            // peer_port = 0
+        mov rdx, 4;                              // mode = 4 (tcp-mirror)
+        call pdxsock_audit_session_start;
+
+        // ---- Mirror pump: recv, send the SAME bytes back, repeat. ----
+        //
+        // No stdin/stdout traffic at all -- r15 (fd), r12 (bytes_in),
+        // r13 (bytes_out) are the only live callee-save state besides
+        // the session fields already threaded (rbx=port, rbp=peer_ip=0,
+        // r14=4). bytes_out tracks the ACTUAL sys_send return (not the
+        // recv'd count) so a partial send is honestly accounted even
+        // though this landing does not retry a partial send (loopback
+        // and every M4-style smoke transfers fit well under the 4 KiB
+        // buffer in one send call; a retry-until-complete send loop is
+        // deferred until a witness demonstrates partial sends occur
+        // here in practice).
+      pdxsock_mirror_loop:
+        mov rdi, r15;
+        lea rsi, [rip + pdxsock_buf];
+        mov rdx, 4096;
+        mov rax, 93;                             // sys_recv
+        syscall;
+        cmp rax, 0;
+        jle pdxsock_client_close;                // peer EOF or error -> close
+        add r12, rax;                            // bytes_in += n
+        mov r9, rax;                             // r9 = n (survives the send call args setup)
+
+        mov rdx, r9;                             // len = n
+        mov rdi, r15;                            // fd (same connection, echo back)
+        lea rsi, [rip + pdxsock_buf];
+        mov rax, 92;                             // sys_send
+        syscall;
+        cmp rax, 0;
+        jl pdxsock_client_close;                 // send failed -> close
+        add r13, rax;                            // bytes_out += n
+
+        jmp pdxsock_mirror_loop;
+
+        // ================================================================
         // v1.1-B shared tail: emit SockSessionRecord@0.1 via sys_semantic_send
         //   (SC+ ID 115), then sys_shutdown + sys_exit(0). Reached from the
         //   client and server recv loops on EOF / -errno.
@@ -1900,12 +2383,20 @@ module Main = structure {
         // matching the peer_ip = 0 convention). Reserved bits stay
         // zero (no OR-in step).
         //
-        // Branch shape: `cmp r14, 1; je pdxsock_emit_zero_port` -- one
-        // conditional over a tiny fall-through, no ret/call encoding.
+        // Branch shape: v1.3.0 (pdxsock#14 tcp-mirror) widens the
+        // "listener-family" check from a single `je` to two -- r14 ==
+        // 1 (tcp-server) and r14 == 4 (tcp-mirror) both carry a LOCAL
+        // bind port in rbx, not a peer port, so both zero it. r14 == 0
+        // (tcp-client) and r14 == 2 (udp-client, pdxsock#6) both carry
+        // the true remote peer port in rbx and keep it.
         mov r11, rbx;                            // r11 = port (client-mode default)
-        cmp r14, 1;                              // server mode?
-        jne pdxsock_emit_pack_port;
-        xor r11, r11;                            // server: peer_port = 0
+        cmp r14, 1;                              // tcp-server?
+        je pdxsock_emit_zero_port;
+        cmp r14, 4;                              // tcp-mirror?
+        je pdxsock_emit_zero_port;
+        jmp pdxsock_emit_pack_port;
+      pdxsock_emit_zero_port:
+        xor r11, r11;                            // listener-family: peer_port = 0
       pdxsock_emit_pack_port:
         shl r11, 32;                             // -> bits 32..47
         or r11, rbp;                             // OR in peer_ip (server-mode rbp = 0)
@@ -2003,11 +2494,13 @@ module Main = structure {
         //   any other argc -> usage / exit 2
         //
         // Mode encoding on r14: 0 = tcp-client, 1 = tcp-server,
-        // 2 = udp-client, 3 = udp-server. Distinct from the socket-side
-        // r14 usage (which only ever holds 0 or 1) because the dry-run
-        // flow never enters pdxsock_udp_stub / pdxsock_client_body /
-        // pdxsock_server_body -- the two r14 encodings never coexist
-        // in one invocation.
+        // 2 = udp-client, 3 = udp-server, 4 = tcp-mirror (v1.3.0,
+        // pdxsock#14). This now MATCHES the socket-side r14 encoding
+        // (which also spans 0/1/2/4 as of v1.3.0 -- see the pdxsock#6/
+        // #14 header sections) except for value 3 (udp-server), which
+        // exists only in the dry-run flow's local classification since
+        // its real-run counterpart short-circuits through
+        // pdxsock_udp_stub before r14 is ever assigned that value.
         //
         // Host / port pointer registers on entry to pdxsock_dry_print:
         //   rbp = host_str ptr (only read for client modes -- r14 == 0
@@ -2075,11 +2568,11 @@ module Main = structure {
         jmp pdxsock_usage;
 
       pdxsock_dry_argc4_u:
-        // "-u <host> <port>" -- udp-client. v1.2.2 (pdxsock#18):
-        // real-run body for this shape is `pdxsock_udp_stub` (exit
-        // 3, "udp stub" diagnostic); dry-run therefore lands on the
-        // matching honest-refusal path rather than the friendly
-        // preview writer that runnable TCP modes use.
+        // "-u <host> <port>" -- udp-client. v1.3.0 (pdxsock#6): the
+        // real-run body for this shape is now a genuine connected-UDP
+        // session (no longer `pdxsock_udp_stub`), so dry-run rejoins
+        // the normal friendly preview writer instead of the
+        // UNIMPLEMENTED refusal path it used through v1.2.2.
         xor rax, rax;
         mov_b rax, [rbx + 2];
         cmp rax, 0;                              // NUL after 'u'
@@ -2087,18 +2580,13 @@ module Main = structure {
         mov r14, 2;
         mov rbp, [r13 + 16];                    // host = effective argv[2]
         mov r15, [r13 + 24];                    // port = effective argv[3]
-        jmp pdxsock_dry_udp_refuse;
+        jmp pdxsock_dry_print;
 
       pdxsock_dry_argc4_l:
-        // "-l -u <port>" -- udp-server refusal. v1.2.2 (pdxsock#18):
-        // real-run body for this shape is `pdxsock_udp_stub` (exit
-        // 3, "udp stub" diagnostic); dry-run therefore lands on the
-        // matching honest-refusal path rather than the friendly
-        // preview writer. Retires the pre-v1.2.2 posture that emitted
-        // a runnable-looking preview even though the real invocation
-        // exits 3 -- operators scripting off dry-run output now see
-        // the same UNIMPLEMENTED sentinel the udp-client refusal
-        // emits, and the two modes share the exit-3 refusal tail.
+        // "-l -u <port>" -- udp-server refusal (STILL out of scope at
+        // v1.3.0; unchanged from v1.2.2). "-l -m <port>" -- v1.3.0
+        // (pdxsock#14) tcp-mirror preview, which IS runnable, so it
+        // rejoins `pdxsock_dry_print` like every other real mode.
         xor rax, rax;
         mov_b rax, [rbx + 2];
         cmp rax, 0;                              // NUL after 'l'
@@ -2111,7 +2599,12 @@ module Main = structure {
         xor rax, rax;
         mov_b rax, [rbx + 1];
         cmp rax, 0x75;                           // 'u'
-        jne pdxsock_usage;
+        je pdxsock_dry_argc4_lu;
+        cmp rax, 0x6d;                           // 'm'
+        je pdxsock_dry_argc4_lm;
+        jmp pdxsock_usage;
+
+      pdxsock_dry_argc4_lu:
         xor rax, rax;
         mov_b rax, [rbx + 2];
         cmp rax, 0;                              // NUL after 'u'
@@ -2119,6 +2612,15 @@ module Main = structure {
         mov r14, 3;
         mov r15, [r13 + 24];                    // port = effective argv[3]
         jmp pdxsock_dry_udp_refuse;
+
+      pdxsock_dry_argc4_lm:
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0;                              // NUL after 'm'
+        jne pdxsock_usage;
+        mov r14, 4;                              // dry-run mode = 4 (tcp-mirror)
+        mov r15, [r13 + 24];                    // port = effective argv[3]
+        jmp pdxsock_dry_print;
 
         // ================================================================
         // Dry-run preview writer.
@@ -2149,9 +2651,12 @@ module Main = structure {
         syscall;
 
         // ---- write(1, mode_str, 10) ----
-        // Pick the mode pointer via a chain of cmp/je. mode == 3 falls
-        // through to pdxsock_dry_write_mode with rsi still pointing at
-        // udp-server (the last lea sets it).
+        // Pick the mode pointer via a chain of cmp/je. mode == 3 (udp-
+        // server) never reaches pdxsock_dry_print (its classifier
+        // jumps to pdxsock_dry_udp_refuse instead), but the udp-server
+        // literal stays as the chain's fallthrough default for
+        // defensive symmetry with the refusal path's own mode chain.
+        // v1.3.0 (pdxsock#14) adds mode == 4 (tcp-mirror).
         lea rsi, [rip + pdxsock_msg_mode_tcp_client];
         cmp r14, 0;
         je pdxsock_dry_write_mode;
@@ -2160,6 +2665,9 @@ module Main = structure {
         je pdxsock_dry_write_mode;
         lea rsi, [rip + pdxsock_msg_mode_udp_client];
         cmp r14, 2;
+        je pdxsock_dry_write_mode;
+        lea rsi, [rip + pdxsock_msg_mode_tcp_mirror];
+        cmp r14, 4;
         je pdxsock_dry_write_mode;
         lea rsi, [rip + pdxsock_msg_mode_udp_server];
         // fall through (mode == 3)
@@ -2178,12 +2686,16 @@ module Main = structure {
         syscall;
 
         // ---- write(1, host_or_any, len) ----
-        // Server modes (r14 == 1 or r14 == 3) emit the literal
-        // "0.0.0.0" -- an honest INADDR_ANY placeholder. Client modes
-        // strlen the argv host string and emit it verbatim.
+        // Listener-family modes (r14 == 1 tcp-server, r14 == 3 udp-
+        // server, r14 == 4 tcp-mirror -- v1.3.0 pdxsock#14) emit the
+        // literal "0.0.0.0" -- an honest INADDR_ANY placeholder.
+        // Client modes strlen the argv host string and emit it
+        // verbatim.
         cmp r14, 1;
         je pdxsock_dry_host_any;
         cmp r14, 3;
+        je pdxsock_dry_host_any;
+        cmp r14, 4;
         je pdxsock_dry_host_any;
         // Client mode: inline strlen on rbp -> rcx.
         xor rcx, rcx;
@@ -2270,17 +2782,19 @@ module Main = structure {
         // sentinel gives them a pattern-match to gate on when they
         // want to detect a stubbed mode explicitly.
         //
-        // Register state at entry: r14 in {2, 3} (mode), r15 = port_str
-        // ptr (unused past classify), rbp = host_str ptr for r14 == 2
-        // (unused past classify). Callee-save regs survive every
-        // syscall by the amd64 fast-syscall convention. rdi/rsi/rdx/rax
-        // are freely scratched. Every SYSCALL below trashes rcx/r11
-        // but neither is read after its issuing syscall.
+        // Register state at entry: r14 == 3 (udp-server; v1.3.0
+        // pdxsock#6 retired the udp-client caller -- see
+        // pdxsock_dry_argc4_u above, which now jumps to
+        // pdxsock_dry_print instead), r15 = port_str ptr (unused past
+        // classify). Callee-save regs survive every syscall by the
+        // amd64 fast-syscall convention. rdi/rsi/rdx/rax are freely
+        // scratched. Every SYSCALL below trashes rcx/r11 but neither
+        // is read after its issuing syscall.
         //
-        // Future maintenance: when a new mode's real body lands, its
-        // dry-run classifier stops jumping here and rejoins the
-        // runnable-preview writer (`pdxsock_dry_print`). When the last
-        // stubbed mode is retired, this label and its supporting
+        // Future maintenance: when udp-server's real body lands (a
+        // `-l -u` recvfrom-based listener), its dry-run classifier
+        // stops jumping here and rejoins the runnable-preview writer
+        // (`pdxsock_dry_print`), and this label plus its supporting
         // literal (`pdxsock_msg_dry_udp_stub`) may be deleted.
         //
         // Encoder discipline per file header: no `test`, `cmp reg, imm`
@@ -2298,16 +2812,10 @@ module Main = structure {
         mov rax, 1;
         syscall;
 
-        // ---- write(1, mode_str, 10) ----
-        // Pick the mode pointer by r14. r14 == 2 -> udp-client;
-        // r14 == 3 falls through to the udp-server literal (only two
-        // callers reach this label, both filed above).
-        lea rsi, [rip + pdxsock_msg_mode_udp_client];
-        cmp r14, 2;
-        je pdxsock_dry_udp_refuse_write_mode;
+        // ---- write(1, "udp-server", 10) ----
+        // Sole reachable mode at this label as of v1.3.0 (see header
+        // note above) -- no branch needed.
         lea rsi, [rip + pdxsock_msg_mode_udp_server];
-
-      pdxsock_dry_udp_refuse_write_mode:
         mov rdi, 1;
         mov rdx, 10;                             // pdxsock_msg_mode_name_len
         mov rax, 1;
